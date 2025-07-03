@@ -476,8 +476,10 @@ UPDATE userinfo SET email='ant@gmail.com' WHERE id=1;
 
 - CRUD****: 모든 프로그램은 이것을 벗어날 수 없다
 ```
-# 질문
+
 ```md
+# TIL+
+
 DB의 종류에 관한 설명 중 Document DB가 JSON을 쓰는걸 알게 되었는데 현재 MCP가 JSON확장자를 쓰고 있다 그렇다면 Document DB가 MCP가 중요해진 현재 AI환경에서도 활용도가 높아졌을까?
 ```
 
