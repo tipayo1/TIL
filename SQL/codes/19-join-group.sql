@@ -1,5 +1,3 @@
--- 19-join-group.sql
-
 USE lecture;
 -- VIP 고객들의 구매 내역 조회 (고객명, 고객유형, 상품명, 카테고리, 주문금액)
 SELECT *
