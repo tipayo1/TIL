@@ -1,3 +1,4 @@
+# 🎯 오늘 학습한 핵심 내용 TIL
 
 # 📊 MySQL 기초 - SELECT, WHERE, 정렬, 데이터 타입, 문자열 함수 TIL
 
