@@ -1,5 +1,4 @@
 # 🎯 오늘 학습한 핵심 내용 TIL
-<img src="https://r2cdn.perplexity.ai/pplx-full-logo-primary-dark%402x.png" class="logo" width="120"/>
 
 # 🔍 MySQL EXPLAIN 기본 사용법 \& 인덱스 성능 분석
 
