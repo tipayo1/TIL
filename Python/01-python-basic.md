@@ -1,5 +1,4 @@
-
-# Python 기초 요약
+# 🎯 01-Python-basic
 
 ## 📘 1. 기본 개요
 - **공식 문서**: Python Tutorial
