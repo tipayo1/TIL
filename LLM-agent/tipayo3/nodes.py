@@ -1,5 +1,9 @@
-# nodes.py (FIXED & MINIMAL)
+# nodes.py (FeatureTree + ε-greedy + VersionStore + metrics++ + preprocess/type-guard)
+
 import os
+import time
+import random
+
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -11,6 +15,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from state import State
 from db import get_vectorstore, get_llm, extract_section_terms
+
 from rpg import (
     configure_rag_for_context,
     RAGComponentRegistry,
@@ -18,11 +23,37 @@ from rpg import (
     unit_test_flow_assertions,
     bind_registry_to_hints,
     LegalRetrievalPlugin,
+    FeatureTree, FeatureTreeNode,
+    RPGVersionStore, merge_rpg,
+    epsilon_best_strategy,
 )
+
+from policy import EPSILON
+
 
 # Shared DataFlowManager & thread pool (IO-bound tasks)
 _DFM = DataFlowManager()
 _EXEC = ThreadPoolExecutor(max_workers=int(os.getenv("RAG_MAX_WORKERS", "4")))
+_STORE = RPGVersionStore(root_dir=os.getenv("RPG_STORE_DIR"))
+
+# ---------------- Preprocess & type guards ----------------
+def _dfm_fill_defaults(frm: str, to: str, st: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(st or {})
+    out.setdefault("retrieval_hints", {"k": 8, "strategy": "semantic"})
+    out.setdefault("plugins", [])
+    out.setdefault("log", [])
+    out.setdefault("documents", [])
+    return out
+
+def _dfm_stringify_query(frm: str, to: str, st: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(st or {})
+    q = out.get("refined_query") or out.get("query")
+    if q is not None and not isinstance(q, str):
+        out["refined_query"] = str(q)
+    return out
+
+_DFM.add_preprocess(_dfm_fill_defaults)
+_DFM.add_preprocess(_dfm_stringify_query)
 
 # ---------------- Utilities ----------------
 def _append_flow_violations(state: State, frm: str, to: str, snapshot: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -34,7 +65,6 @@ def _append_flow_violations(state: State, frm: str, to: str, snapshot: Dict[str,
     return violations
 
 def _get_question(state: State) -> str:
-    # prefer latest human/user message; fallback to explicit field
     msgs = state.get("messages") or []
     for m in reversed(list(msgs)):
         content = None
@@ -69,7 +99,33 @@ def _source_diversity(docs_: List[Document]) -> float:
         sources.add(src)
     return round(len(sources) / max(1, len(docs_)), 3)
 
-def _calc_metrics(docs: List[Document], k: int) -> Dict[str, Any]:
+def _intent_coverage(docs: List[Document], query: str) -> float:
+    terms = extract_section_terms(query) or []
+    if not terms or not docs:
+        return 0.0 if not docs else 0.5
+    hits = 0
+    for d in docs:
+        ns_terms = (d.metadata or {}).get("ns_terms") or []
+        if any(t in ns_terms for t in terms):
+            hits += 1
+    return round(hits / max(1, len(docs)), 3)
+
+def _negative_rate(docs: List[Document]) -> float:
+    if not docs:
+        return 1.0
+    scores = [float((d.metadata or {}).get("score") or 0.0) for d in docs]
+    negs = sum(1 for s in scores if s <= 0.0)
+    return round(negs / max(1, len(scores)), 3)
+
+def _novel_contrib(current: List[Document], prev: List[Document]) -> float:
+    prev_src = set((d.metadata or {}).get("source") for d in prev or [])
+    cur_src = set((d.metadata or {}).get("source") for d in current or [])
+    if not cur_src:
+        return 0.0
+    novel = len([s for s in cur_src if s not in prev_src])
+    return round(novel / max(1, len(cur_src)), 3)
+
+def _calc_metrics(docs: List[Document], k: int, query: str, prev_docs: Optional[List[Document]] = None) -> Dict[str, Any]:
     n = len(docs)
     scores = [
         float((d.metadata or {}).get("score") or 0.0)
@@ -79,11 +135,22 @@ def _calc_metrics(docs: List[Document], k: int) -> Dict[str, Any]:
     avg_score = round(sum(scores) / len(scores), 4) if scores else 0.0
     coverage = round(min(1.0, n / max(1, k)), 3)
     diversity = _source_diversity(docs)
-    return {"k": k, "n": n, "avg_score": avg_score, "coverage": coverage, "diversity": diversity}
+    intent_cov = _intent_coverage(docs, query)
+    neg_rate = _negative_rate(docs)
+    novel_contrib = _novel_contrib(docs, prev_docs or [])
+    return {
+        "k": k,
+        "n": n,
+        "avg_score": avg_score,
+        "coverage": coverage,
+        "diversity": diversity,
+        "intent_coverage": intent_cov,
+        "negative_rate": neg_rate,
+        "novel_evidence_contrib": novel_contrib,
+    }
 
-def _run_vs_search(vs, q: str, k: int) -> List[Tuple[Document, float]]:
-    # execute similarity search in thread pool to avoid blocking event loops
-    fut = _EXEC.submit(vs.similarity_search_with_score, q, k)
+def _run_vs_search(vs, q: str, k: int, meta_filter: Optional[Dict[str, Any]] = None) -> List[Tuple[Document, float]]:
+    fut = _EXEC.submit(vs.similarity_search_with_score, q, k, None, meta_filter)
     return fut.result()
 
 def _merge_scored_docs(pairs: List[Tuple[Document, float]], seen: set) -> List[Document]:
@@ -99,211 +166,227 @@ def _merge_scored_docs(pairs: List[Tuple[Document, float]], seen: set) -> List[D
         out.append(d)
     return out
 
+def _now() -> float:
+    return time.time()
+
+def _apply_rpg_subgraph_filter(docs: List[Document], state: State) -> List[Document]:
+    ctx = state.get("context_type") or "general"
+    q = state.get("refined_query") or state.get("query") or ""
+    q_terms = extract_section_terms(q) or []
+    kept: List[Document] = []
+    for d in docs:
+        md = d.metadata or {}
+        ext = (md.get("ext") or "").lower()
+        ns_terms = md.get("ns_terms") or []
+        ok = True
+        if ctx == "legal":
+            ok = (any(t in ns_terms for t in q_terms) if q_terms else ext in [".pdf", ".docx", ".md", ".txt"])
+        elif ctx == "technical":
+            ok = ext in [".py", ".ipynb", ".md", ".rst", ".json", ".yaml", ".yml", ".toml"]
+        elif ctx == "conversational":
+            ok = ext in [".md", ".txt", ".html", ".htm"]
+        if ok:
+            kept.append(d)
+    return kept
+
+def _thread_id(state: State) -> str:
+    return (state.get("thread_id") or os.getenv("THREAD_ID") or "default")
+
 # ---------------- Compose RPG ----------------
 def compose_rpg(state: State) -> Dict[str, Any]:
     q = (_get_question(state) or state.get("refined_query") or state.get("query") or "").strip()
     context_type = _infer_context_type(q)
 
+    # Build context RPG and registry
     rpg_graph = configure_rag_for_context(context_type, q)
-    registry = RAGComponentRegistry().to_dict()
+    registry_obj = RAGComponentRegistry()
+    registry = registry_obj.to_dict()
 
     # base hints + registry binding
     hints = state.get("retrieval_hints") or {"k": 8, "strategy": "semantic"}
-    hints = bind_registry_to_hints(registry, context_type, hints)
+    hints = bind_registry_to_hints(registry, context_type, hints)  # merge feature->module/file hints
+    hints = registry_obj.merge_feature_hints(hints)  # feature tree: minimal derivation from hints
 
-    # optional plugins
-    plugins = state.get("plugins") or []
-    if context_type == "legal":
-        p = LegalRetrievalPlugin()
-        upd = p.execute({"retrieval_hints": hints, "plugins": plugins})
-        hints = upd.get("retrieval_hints", hints)
-        plugins = upd.get("plugins", plugins)
+    ft_roots = [
+        FeatureTreeNode(fid="retrieval", name="Retrieval", children=[
+            FeatureTreeNode(fid="retrieval.semantic", name="Semantic", score=0.5, file_hint="retrievers/semantic.py"),
+            FeatureTreeNode(fid="retrieval.hybrid", name="Hybrid", score=0.6, file_hint="retrievers/hybrid.py"),
+            FeatureTreeNode(fid="retrieval.expand", name="Expand", score=0.7, file_hint="retrievers/expand.py"),
+        ]),
+        FeatureTreeNode(fid="rerank", name="Rerank", children=[
+            FeatureTreeNode(fid="rerank.cross_encoder", name="CrossEncoder", score=0.7, file_hint="rerankers/cross_encoder.py"),
+            FeatureTreeNode(fid="rerank.llm_based", name="LLM", score=0.5, file_hint="rerankers/llm_based.py"),
+        ]),
+    ]
 
-    flows = _DFM.describe()
-    path = rpg_graph.suggest_execution_path(state.get("retrieval_metrics") or {})
-    schema_issues = unit_test_flow_assertions(_DFM)
+    ft = FeatureTree(ft_roots)
+    selected = epsilon_best_strategy(ft, epsilon=EPSILON)
+    # Persist lightweight selection/version info if store is configured
+    try:
+        if _STORE is not None:
+            _STORE.save({"ts": _now(), "ctx": context_type, "feature": selected})
+    except Exception:
+        pass
 
-    log = (state.get("log") or []) + [{"phase": "setup", "rpg": True, "path": path, "schema_issues": schema_issues}]
-    return {
-        "rpg": {"graph": rpg_graph.to_dict(), "registry": registry, "flows": flows},
-        "execution_path": path,
-        "retrieval_hints": hints,
+    log = (state.get("log") or []) + [{"at": "compose_rpg", "ctx": context_type, "selected": selected, "ts": _now()}]
+    out = {
+        "query": q or state.get("query"),
+        "refined_query": q,
         "context_type": context_type,
-        "plugins": plugins,
-        "phase": "setup",
-        "log": log,
-        "flow_violations": state.get("flow_violations") or [],
-    }
-
-# ---------------- Intent parsing ----------------
-def intent_parser(state: State) -> Dict[str, Any]:
-    base = _get_question(state)
-    prev_q = (state.get("query") or "").strip()
-
-    reset_block: Dict[str, Any] = {}
-    if base and base != prev_q:
-        reset_block = {
-            "retrieved_docs": [],
-            "retrieval_metrics": {},
-            "answer_plan": [],
-            "answer": "",
-        }
-
-    hints = state.get("retrieval_hints") or {"k": 8, "strategy": "semantic"}
-    update: Dict[str, Any] = {
-        "query": base,
-        "refined_query": base,
+        "rpg_graph": rpg_graph,
+        "registry": registry,
         "retrieval_hints": hints,
-        "phase": "refine",
-        **reset_block,
+        "feature_choice": selected,
+        "log": log,
     }
+    out["flow_violations"] = _append_flow_violations(state, "compose_rpg", "intent_parser", out)
+    return out
 
-    violations = _append_flow_violations(state, "intent_parser", "retrieve_rpg", {**state, **update})
-    log = (state.get("log") or []) + [{"phase": "refine", "refined_query": base, "hints": hints, "violations": len(violations)}]
-    update["log"] = log
-    update["flow_violations"] = violations
-    return update
+# ---------------- Intent parse ----------------
+def intent_parser(state: State) -> Dict[str, Any]:
+    q = _get_question(state)
+    # Simple heuristic refining
+    refined = q.strip()
+    log = (state.get("log") or []) + [{"at": "intent_parser", "refined": refined, "ts": _now()}]
+    out = dict(state or {})
+    out.update({"refined_query": refined, "log": log})
+    out["flow_violations"] = _append_flow_violations(state, "intent_parser", "retrieve_rpg", out)
+    return out
 
-# ---------------- Primary retrieval ----------------
+# ---------------- Retrieval ----------------
 def retrieve_rpg(state: State) -> Dict[str, Any]:
     vs = get_vectorstore()
     q = state.get("refined_query") or state.get("query") or ""
-    hints = state.get("retrieval_hints") or {}
-    k = int(hints.get("k") or 8)
+    hints = (state.get("retrieval_hints") or {}).copy()
+    k = int(hints.get("k", 8))
     strategy = hints.get("strategy", "semantic")
-    section_boost = bool(hints.get("section_boost"))
+    meta_filter = hints.get("filter")
 
-    docs: List[Document] = []
+    seen = set()
+    pairs: List[Tuple[Document, float]] = []
+
+    # Basic semantic search
+    pairs.extend(_run_vs_search(vs, q, k, meta_filter))
+
+    # Optional hybrid addition (simple heuristic)
     if strategy == "hybrid":
-        # run two searches concurrently and merge
-        terms = extract_section_terms(q) or []
-        expanded_query = (q + " " + " ".join(terms)).strip() if terms else q
-        fut_a = _EXEC.submit(vs.similarity_search_with_score, q, int(k * 0.6))
-        fut_b = _EXEC.submit(vs.similarity_search_with_score, expanded_query, int(k * 0.6))
-        pairs = fut_a.result() + fut_b.result()
-        seen = set()
-        docs = _merge_scored_docs(pairs, seen)
-    else:
-        # semantic but with legal section boost if requested
-        base_pairs = _run_vs_search(vs, q, k)
-        seen = set()
-        docs = _merge_scored_docs(base_pairs, seen)
-        if section_boost:
-            terms = extract_section_terms(q) or []
-            if terms:
-                expanded_query = (q + " " + " ".join(terms)).strip()
-                extra_pairs = _run_vs_search(vs, expanded_query, max(4, int(k * 0.5)))
-                docs += _merge_scored_docs(extra_pairs, seen)
+        # lightweight simulate by increasing k and merging
+        more = _run_vs_search(vs, q, max(1, k // 2), meta_filter)
+        pairs.extend(more)
 
-    metrics = _calc_metrics(docs, k)
-    update = {"retrieved_docs": docs, "retrieval_metrics": metrics, "phase": "search"}
-    violations = _append_flow_violations(state, "retrieve_rpg", "award_xp", {**state, **update})
-    log = (state.get("log") or []) + [{"phase": "search", "k": k, "strategy": strategy, "metrics": metrics, "violations": len(violations)}]
-    update["log"] = log
-    update["flow_violations"] = violations
-    return update
+    docs = _merge_scored_docs(pairs, seen)
+    # Context-aware filter using RPG subgraph
+    docs = _apply_rpg_subgraph_filter(docs, state)
 
-# ---------------- Expanded retrieval ----------------
+    prev_docs = state.get("documents") or []
+    metrics = _calc_metrics(docs, k, q, prev_docs)
+
+    log = (state.get("log") or []) + [{"at": "retrieve_rpg", "n": len(docs), "k": k, "strategy": strategy, "ts": _now()}]
+    out = dict(state or {})
+    out.update({
+        "documents": docs,
+        "retrieval_metrics": metrics,
+        "last_retrieval_ts": _now(),
+        "log": log,
+    })
+    out["flow_violations"] = _append_flow_violations(state, "retrieve_rpg", "award_xp", out)
+    return out
+
+# ---------------- Expand search ----------------
 def expand_search(state: State) -> Dict[str, Any]:
     vs = get_vectorstore()
     q = state.get("refined_query") or state.get("query") or ""
-    terms = extract_section_terms(q) or []
-    expanded = (q + " " + " ".join(terms)).strip() if terms else q
+    hints = (state.get("retrieval_hints") or {}).copy()
+    base_k = int(hints.get("k", 8))
+    new_k = min(32, base_k * 2)
+    meta_filter = hints.get("filter")
 
-    base_docs = state.get("retrieved_docs") or []
-    k = int((state.get("retrieval_hints") or {}).get("k", 16))
-    pairs = _run_vs_search(vs, expanded, k)
+    seen = set((d.page_content.strip()[:120], (d.metadata or {}).get("source", "")) for d in (state.get("documents") or []))
+    pairs = _run_vs_search(vs, q, new_k, meta_filter)
+    more_docs = _merge_scored_docs(pairs, seen)
 
-    seen = set((d.page_content.strip()[:120], (d.metadata or {}).get("source", "")) for d in base_docs)
-    new_docs = _merge_scored_docs(pairs, seen)
-    merged = list(base_docs) + new_docs
+    docs = (state.get("documents") or []) + more_docs
+    metrics = _calc_metrics(docs, new_k, q, state.get("documents") or [])
 
-    metrics = _calc_metrics(merged, k)
-    update = {"retrieved_docs": merged, "retrieval_metrics": metrics, "phase": "expand"}
-    violations = _append_flow_violations(state, "expand_search", "rerank", {**state, **update})
-    log = (state.get("log") or []) + [{"phase": "expand", "query": expanded, "metrics": metrics, "violations": len(violations)}]
-    update["log"] = log
-    update["flow_violations"] = violations
-    return update
+    log = (state.get("log") or []) + [{"at": "expand_search", "added": len(more_docs), "k": new_k, "ts": _now()}]
+    out = dict(state or {})
+    out.update({
+        "documents": docs,
+        "retrieval_metrics": metrics,
+        "retrieval_hints": {**hints, "k": new_k, "strategy": "expand"},
+        "log": log,
+    })
+    out["flow_violations"] = _append_flow_violations(state, "expand_search", "rerank", out)
+    return out
 
-# ---------------- XP update and path refresh ----------------
+# ---------------- Award XP ----------------
 def award_xp(state: State) -> Dict[str, Any]:
-    met = state.get("retrieval_metrics") or {}
-    xp = int(state.get("xp") or 0)
-    fails = int(state.get("fail_count") or 0)
-
-    n = int(met.get("n") or 0)
-    coverage = float(met.get("coverage") or 0.0)
-    diversity = float(met.get("diversity") or 0.0)
-
-    delta = 1 + int(coverage * 3) + int(diversity * 2) + (2 if n >= 8 else 0)
-    xp += max(1, delta)
-    if n == 0:
-        fails += 1
-
-    try:
-        from rpg import RPGGraph  # local import
-        new_path = RPGGraph().suggest_execution_path(met)
-    except Exception:
-        new_path = state.get("execution_path") or []
-
-    update = {
-        "xp": xp,
-        "fail_count": fails,
-        "execution_path": new_path or state.get("execution_path") or [],
-        "phase": state.get("phase") or "search",
-    }
-    # logging only (branching is handled by graph conditional edges)
-    log = (state.get("log") or []) + [{"phase": "search", "xp_award": delta, "xp_total": xp, "path": new_path}]
-    update["log"] = log
-    update["flow_violations"] = state.get("flow_violations") or []
-    return update
+    m = state.get("retrieval_metrics") or {}
+    # Simple XP heuristic: coverage and diversity weighted
+    xp = round(100 * (0.5 * float(m.get("coverage", 0)) + 0.5 * float(m.get("diversity", 0))), 2)
+    log = (state.get("log") or []) + [{"at": "award_xp", "xp": xp, "metrics": m, "ts": _now()}]
+    out = dict(state or {})
+    out.update({"xp": xp, "log": log})
+    # Next hop decided by policy.decide_after_xp in the graph
+    return out
 
 # ---------------- Rerank ----------------
 def rerank(state: State) -> Dict[str, Any]:
-    docs = state.get("retrieved_docs") or []
-    docs = sorted(docs, key=lambda d: float((d.metadata or {}).get("score") or 0.0), reverse=True)[:20]
-    update = {"retrieved_docs": docs, "phase": "rerank"}
-    violations = _append_flow_violations(state, "rerank", "plan_answer", {**state, **update})
-    log = (state.get("log") or []) + [{"phase": "rerank", "kept": len(docs), "violations": len(violations)}]
-    update["log"] = log
-    update["flow_violations"] = violations
-    return update
+    docs = state.get("documents") or []
+    # Default rerank by existing score desc; placeholder for CE/LLM rerank
+    reranked = sorted(docs, key=lambda d: float((d.metadata or {}).get("score") or 0.0), reverse=True)
+    log = (state.get("log") or []) + [{"at": "rerank", "n": len(reranked), "ts": _now()}]
+    out = dict(state or {})
+    out.update({"documents": reranked, "log": log})
+    out["flow_violations"] = _append_flow_violations(state, "rerank", "plan_answer", out)
+    return out
 
-# ---------------- Plan ----------------
+# ---------------- Plan answer ----------------
 def plan_answer(state: State) -> Dict[str, Any]:
-    docs = state.get("retrieved_docs") or []
     q = state.get("refined_query") or state.get("query") or ""
-    plan: List[Dict[str, Any]] = []
-    for i, d in enumerate(docs[:8]):
-        snippet = d.page_content.strip().splitlines()[0][:160]
-        plan.append({"claim": f"근거 {i+1}: {snippet}", "evidence": [i]})
-    update = {"answer_plan": plan, "phase": "plan"}
-    violations = _append_flow_violations(state, "plan_answer", "generate_answer", {**state, **update})
-    log = (state.get("log") or []) + [{"phase": "plan", "items": len(plan), "query": q, "violations": len(violations)}]
-    update["log"] = log
-    update["flow_violations"] = violations
-    return update
+    docs = state.get("documents") or []
 
-# ---------------- Generate ----------------
+    # Build lightweight plan: select top sources and key points
+    top = docs[: min(5, len(docs))]
+    sources = []
+    for d in top:
+        md = d.metadata or {}
+        sources.append(md.get("source") or md.get("url") or "unknown")
+
+    plan = {
+        "steps": [
+            {"id": 1, "action": "summarize", "detail": "Top documents summary"},
+            {"id": 2, "action": "ground", "detail": "Ground answer with citations"},
+            {"id": 3, "action": "finalize", "detail": "Produce concise answer"},
+        ],
+        "sources": sources,
+        "k": len(top),
+    }
+    log = (state.get("log") or []) + [{"at": "plan_answer", "k": plan["k"], "ts": _now()}]
+    out = dict(state or {})
+    out.update({"answer_plan": plan, "log": log})
+    out["flow_violations"] = _append_flow_violations(state, "plan_answer", "generate_answer", out)
+    return out
+
+# ---------------- Generate answer ----------------
 def generate_answer(state: State) -> Dict[str, Any]:
     llm = get_llm()
     q = state.get("refined_query") or state.get("query") or ""
-    docs = state.get("retrieved_docs") or []
-    plan = state.get("answer_plan") or []
+    docs = state.get("documents") or []
+    plan = state.get("answer_plan") or {}
 
-    evid_texts: List[str] = []
-    for item in plan[:6]:
-        for idx in item.get("evidence", []):
-            if 0 <= idx < len(docs):
-                d = docs[idx]
-                src = (d.metadata or {}).get("source") or ""
-                evid_texts.append(f"[{idx}] {src}: {d.page_content[:300]}")
+    context_blurb = "\n\n".join(
+        f"- [{(d.metadata or {}).get('source') or (d.metadata or {}).get('url') or 'unknown'}] {d.page_content[:300]}"
+        for d in docs[: min(5, len(docs))]
+    )
+    sys = SystemMessage(content="You are a helpful assistant. Ground answers in provided context when possible.")
+    hum = HumanMessage(content=f"Question: {q}\n\nContext:\n{context_blurb}\n\nPlan: {plan}")
 
-    system = SystemMessage(content="답변은 근거 기반으로 간결하게 작성하고, 필요한 경우 근거 색인 번호를 각 문단 끝에 대괄호로 표기하세요.")
-    human = HumanMessage(content=f"질문: {q}\n\n근거 후보:\n" + "\n".join(evid_texts))
-    resp = llm.invoke([system, human])
-    text = getattr(resp, "content", "") if hasattr(resp, "content") else str(resp)
+    resp = llm.invoke([sys, hum])
+    text = getattr(resp, "content", None) or getattr(resp, "text", None) or str(resp)
 
-    log = (state.get("log") or []) + [{"phase": "answer", "chars": len(text)}]
-    return {"answer": text, "phase": "answer", "log": log}
+    messages = (state.get("messages") or []) + [{"role": "assistant", "content": text}]
+    log = (state.get("log") or []) + [{"at": "generate_answer", "len": len(text or ''), "ts": _now()}]
+    out = dict(state or {})
+    out.update({"answer": text, "messages": messages, "log": log})
+    return out
