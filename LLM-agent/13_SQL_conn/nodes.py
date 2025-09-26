@@ -14,7 +14,6 @@ class AnalysisOutput(TypedDict):
     able_to_query: Annotated[Literal[True, False], ..., "SQL 쿼리 가능 여부"]
     rejection_reason: Annotated[str, ..., "결정에 대한 간략한 설명"]
 
-
 # 사용자 질문 분석 Node
 def question_analysis(state: State):
     """사용자 질문을 분석하여 SQL 생성 필요 여부를 결정하고, 그 결과를 상태에 저장"""
