@@ -2,7 +2,6 @@
 
 from langgraph.graph import StateGraph, START, END  # type: ignore
 from state import State  # type: ignore
-
 from nodes import (  # type: ignore
     compose_rpg,
     intent_parser,
@@ -13,14 +12,13 @@ from nodes import (  # type: ignore
     plan_answer,
     generate_answer,
 )
-
 from policy import decide_after_xp  # type: ignore
 
 
 def build_app():
     builder = StateGraph(State)
 
-    # Start directly with RAG composition
+    # Nodes
     builder.add_node("compose_rpg", compose_rpg)
     builder.add_node("intent_parser", intent_parser)
     builder.add_node("retrieve_rpg", retrieve_rpg)
@@ -30,15 +28,13 @@ def build_app():
     builder.add_node("plan_answer", plan_answer)
     builder.add_node("generate_answer", generate_answer)
 
-    # START -> compose_rpg
+    # Edges
     builder.add_edge(START, "compose_rpg")
-
-    # RAG subgraph
     builder.add_edge("compose_rpg", "intent_parser")
     builder.add_edge("intent_parser", "retrieve_rpg")
     builder.add_edge("retrieve_rpg", "award_xp")
 
-    # Conditional path after XP award
+    # Conditional edges after XP
     builder.add_conditional_edges(
         "award_xp",
         decide_after_xp,
@@ -53,8 +49,7 @@ def build_app():
     builder.add_edge("plan_answer", "generate_answer")
     builder.add_edge("generate_answer", END)
 
-    compiled = builder.compile()
-    return compiled
+    return builder.compile()
 
 
 # Default app

@@ -23,6 +23,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 _ALLOWED_EXTS = [".txt", ".md", ".pdf", ".docx", ".html", ".htm", ".pptx"]
 
+
 def _candidate_db_dirs() -> List[Path]:
     cands: List[Path] = []
     env_dir = os.getenv("DB_DIR")
@@ -32,6 +33,7 @@ def _candidate_db_dirs() -> List[Path]:
     here = Path(__file__).resolve().parent
     cands.append(here.parent / "db")
     return cands
+
 
 def resolve_db_dir(create_if_missing: bool = False) -> Optional[Path]:
     for p in _candidate_db_dirs():
@@ -46,6 +48,7 @@ def resolve_db_dir(create_if_missing: bool = False) -> Optional[Path]:
             return None
     return None
 
+
 def _scan_files(dir_path: Path) -> List[str]:
     out: List[str] = []
     for root, _, files in os.walk(str(dir_path)):
@@ -55,6 +58,7 @@ def _scan_files(dir_path: Path) -> List[str]:
                 out.append(str(Path(root) / fn))
     out.sort()
     return out
+
 
 def _fingerprint_paths(paths: List[str]) -> str:
     h = hashlib.sha1()
@@ -66,6 +70,7 @@ def _fingerprint_paths(paths: List[str]) -> str:
             h.update(f"{p}:NA".encode("utf-8"))
     return h.hexdigest()
 
+
 def _load_txt(path: str) -> List[Document]:
     try:
         from langchain_community.document_loaders import TextLoader
@@ -74,12 +79,14 @@ def _load_txt(path: str) -> List[Document]:
         with open(path, "r", encoding="utf-8", errors="ignore") as f:
             return [Document(page_content=f.read(), metadata={"source": path})]
 
+
 def _load_md(path: str) -> List[Document]:
     try:
         from langchain_community.document_loaders import UnstructuredMarkdownLoader
         return UnstructuredMarkdownLoader(path, mode="single").load()
     except Exception:
         return _load_txt(path)
+
 
 def _load_pdf(path: str) -> List[Document]:
     try:
@@ -96,6 +103,7 @@ def _load_pdf(path: str) -> List[Document]:
             except Exception as e:
                 raise RuntimeError(f"PDF 로딩 실패: {path} ({e})")
 
+
 def _load_docx(path: str) -> List[Document]:
     try:
         from langchain_community.document_loaders import Docx2txtLoader
@@ -106,6 +114,7 @@ def _load_docx(path: str) -> List[Document]:
             return UnstructuredWordDocumentLoader(path).load()
         except Exception:
             return _load_txt(path)
+
 
 def _load_html(path: str) -> List[Document]:
     try:
@@ -118,12 +127,14 @@ def _load_html(path: str) -> List[Document]:
         except Exception:
             return _load_txt(path)
 
+
 def _load_pptx(path: str) -> List[Document]:
     try:
         from langchain_community.document_loaders import UnstructuredPowerPointLoader
         return UnstructuredPowerPointLoader(path).load()
     except Exception:
         return _load_txt(path)
+
 
 def _iter_paths(path: str) -> List[str]:
     if os.path.isdir(path):
@@ -135,6 +146,7 @@ def _iter_paths(path: str) -> List[str]:
                     out.append(os.path.join(root, fn))
         return out
     return [path]
+
 
 def load_documents_from_paths(paths: Union[str, List[str]]) -> List[Document]:
     if isinstance(paths, str):
@@ -164,14 +176,17 @@ def load_documents_from_paths(paths: Union[str, List[str]]) -> List[Document]:
                 docs.append(d)
     return docs
 
+
 import re as _re
 _section_pat = _re.compile(r"(제\s*\d+\s*조|별표\s*\d+\s*호|부칙|총칙|정의)")
+
 
 def extract_section_terms(text: str) -> List[str]:
     if not text:
         return []
     hits = _section_pat.findall(text)
     return [_re.sub(r"\s+", "", h) for h in hits]
+
 
 def _annotate_sections(docs: List[Document]) -> List[Document]:
     for d in docs:
@@ -181,6 +196,7 @@ def _annotate_sections(docs: List[Document]) -> List[Document]:
         d.metadata = meta
     return docs
 
+
 def _chunk_documents(docs: List[Document]) -> List[Document]:
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=int(os.getenv("CHUNK_SIZE", "800")),
@@ -189,12 +205,14 @@ def _chunk_documents(docs: List[Document]) -> List[Document]:
     )
     return splitter.split_documents(docs)
 
+
 def _doc_ids(docs: List[Document]) -> List[str]:
     ids: List[str] = []
     for d in docs:
         basis = (d.page_content or "") + "|" + (d.metadata.get("source") or "")
         ids.append(hashlib.sha1(basis.encode("utf-8")).hexdigest())
     return ids
+
 
 def _ensure_pinecone_index(pc: Any, index_name: str):
     if pc is None:
@@ -214,6 +232,7 @@ def _ensure_pinecone_index(pc: Any, index_name: str):
     except Exception:
         pass
 
+
 def get_llm(role: str = "gen") -> ChatOpenAI:
     """
     role:
@@ -228,7 +247,9 @@ def get_llm(role: str = "gen") -> ChatOpenAI:
     temperature = float(os.getenv("GEN_TEMPERATURE", "0.2"))
     return ChatOpenAI(model=model, temperature=temperature)
 
+
 _VECTORSTORE_CACHE: Dict[str, Dict[str, Any]] = {}
+
 
 def _get_cached_vs(index_name: str) -> Optional[PineconeVectorStore]:
     cache = _VECTORSTORE_CACHE.get(index_name)
@@ -236,14 +257,17 @@ def _get_cached_vs(index_name: str) -> Optional[PineconeVectorStore]:
         return cache.get("vs")
     return None
 
+
 def _set_cached_vs(index_name: str, vs: Any, fp: Optional[str]) -> None:
     _VECTORSTORE_CACHE[index_name] = {"vs": vs, "fp": fp}
+
 
 def _get_cached_fp(index_name: str) -> Optional[str]:
     cache = _VECTORSTORE_CACHE.get(index_name)
     if cache:
         return cache.get("fp")
     return None
+
 
 class _VSAdapter:
     """
@@ -261,6 +285,7 @@ class _VSAdapter:
             query, k, filter=meta_filter, namespace=namespace
         )
 
+
 def get_vectorstore(
     index_name: str = "iitp-regulations",
     file_paths: Optional[Union[str, List[str]]] = None,
@@ -273,11 +298,11 @@ def get_vectorstore(
     _ensure_pinecone_index(pc, index_name)
 
     embeddings = OpenAIEmbeddings(model=os.getenv("EMBED_MODEL", "text-embedding-3-small"))
+
     vs = _get_cached_vs(index_name)
     if vs is None:
         vs = PineconeVectorStore(index_name=index_name, embedding=embeddings, text_key="text")
-        # 시그니처 호환 어댑터 적용
-        vs = _VSAdapter(vs)
+        vs = _VSAdapter(vs)  # 시그니처 호환 어댑터 적용
         _set_cached_vs(index_name, vs, None)
 
     if not auto_bootstrap:
@@ -313,9 +338,9 @@ def get_vectorstore(
             ids = _doc_ids(chunks)
             batch_size = int(os.getenv("EMBED_BATCH_SIZE", "64"))
             for i in range(0, len(chunks), batch_size):
-                batch_docs = chunks[i : i + batch_size]
-                batch_ids = ids[i : i + batch_size]
-                # 어댑터에는 add_documents 그대로 위임됨
+                batch_docs = chunks[i: i + batch_size]
+                batch_ids = ids[i: i + batch_size]
                 vs.add_documents(documents=batch_docs, ids=batch_ids)
             _set_cached_vs(index_name, vs, fp)
+
     return vs
