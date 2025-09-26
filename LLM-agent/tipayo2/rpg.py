@@ -1,17 +1,15 @@
-# rpg.py (UPDATED: policy integration)
-from __future__ import annotations
+# rpg.py (UPDATED: persistent store + merge utility + existing RPG schema)
 
+from __future__ import annotations
 import os
 import json
+import time
+from pathlib import Path
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Any, Tuple
 from abc import ABC, abstractmethod
-
 from policy import need_expand, COVERAGE_TH, DIVERSITY_TH  # centralized policy
 
-# -----------------------------
-# Config (env-driven overrides)
-# -----------------------------
 def _float_env(name: str, default: float) -> float:
     try:
         return float(os.getenv(name, str(default)))
@@ -34,11 +32,7 @@ DEFAULT_PATH = json.loads(
     )
 )
 
-# -----------------------------
-# RPG Nodes / Graph (lightweight)
-# -----------------------------
 def _prune_meta(meta: Dict[str, Any], max_kv: int = 16) -> Dict[str, Any]:
-    """Keep only small scalar/meta keys to avoid oversized payloads."""
     out: Dict[str, Any] = {}
     for k, v in meta.items():
         if isinstance(v, (str, int, float, bool)) and len(str(v)) < 200:
@@ -50,7 +44,7 @@ class RPGNode:
     name: str
     node_type: str  # "capability" | "component" | "function"
     children: List["RPGNode"] = field(default_factory=list)
-    dependencies: List[str] = field(default_factory=list)  # names
+    dependencies: List[str] = field(default_factory=list)
     data_flows: List[Dict[str, Any]] = field(default_factory=list)
     meta: Dict[str, Any] = field(default_factory=dict)
 
@@ -76,9 +70,6 @@ class RPGGraph:
         return {"meta": _prune_meta(dict(self.meta)), "roots": [r.to_dict() for r in self.root_nodes]}
 
     def suggest_execution_path(self, metrics: Optional[Dict[str, Any]] = None) -> List[str]:
-        """
-        Provide a recommended path; LangGraph execution remains the source of truth.
-        """
         m = metrics or {}
         path = ["intent_parser", "retrieve_rpg"]
         if need_expand(m):
@@ -86,12 +77,8 @@ class RPGGraph:
         path += ["rerank", "plan_answer", "generate_answer"]
         return path
 
-# -----------------------------
-# Registry and Binding
-# -----------------------------
 class RAGComponentRegistry:
     def __init__(self):
-        # defaults
         self.retrieval_strategies: Dict[str, Dict[str, Any]] = {
             "semantic": {"name": "semantic", "k": 8},
             "expand": {"name": "expand", "k": 16},
@@ -110,7 +97,6 @@ class RAGComponentRegistry:
             "template": {"name": "template"},
             "cot": {"name": "chain_of_thought"},
         }
-        # optional env overrides (json)
         if (ov := _load_json_env("RAG_STRATEGIES_JSON")):
             self.retrieval_strategies.update(ov.get("retrieval", {}))
             self.rerankers.update(ov.get("rerankers", {}))
@@ -123,14 +109,7 @@ class RAGComponentRegistry:
             "generators": self.generators,
         }
 
-def bind_registry_to_hints(
-    registry: Dict[str, Any],
-    context_type: str,
-    base_hints: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    """
-    Choose retrieval/rerank/generation config by context and merge into hints.
-    """
+def bind_registry_to_hints(registry: Dict[str, Any], context_type: str, base_hints: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     hints = dict(base_hints or {})
     retr_map = registry.get("retrieval", {})
     rer_map = registry.get("rerankers", {})
@@ -164,13 +143,7 @@ def bind_registry_to_hints(
         hints["generator"] = gen.get("name")
     return hints
 
-# -----------------------------
-# Data Flow contracts
-# -----------------------------
 class DataFlowManager:
-    """
-    Describe payload schemas and validate runtime state against contracts.
-    """
     def __init__(self):
         self.schemas: Dict[Tuple[str, str], Dict[str, Any]] = {
             ("intent_parser", "retrieve_rpg"): {"required": ["refined_query", "retrieval_hints"]},
@@ -197,7 +170,6 @@ class DataFlowManager:
         return {"ok": len(violations) == 0, "violations": violations}
 
 def unit_test_flow_assertions(dfm: DataFlowManager) -> List[str]:
-    """Simple static checks for schema coherence."""
     issues: List[str] = []
     for desc in dfm.describe():
         schema = desc["schema"]
@@ -205,20 +177,15 @@ def unit_test_flow_assertions(dfm: DataFlowManager) -> List[str]:
             issues.append(f"Schema invalid for {desc['from']}->{desc['to']}")
     return issues
 
-# -----------------------------
-# Domain graph builders
-# -----------------------------
 def build_general_rag_graph(query: str) -> RPGGraph:
     understand = RPGNode("QueryUnderstanding", "capability")
     retrieve = RPGNode("Retrieval", "capability", dependencies=["QueryUnderstanding"])
     rerank = RPGNode("Rerank", "capability", dependencies=["Retrieval"])
     plan = RPGNode("Plan", "capability", dependencies=["Rerank"])
     answer = RPGNode("Answer", "capability", dependencies=["Plan"])
-
     retrieve_sem = RPGNode("SemanticRetrieval", "component", meta={"k": 8})
     retrieve_exp = RPGNode("ExpandedRetrieval", "component", meta={"k": 16})
     retrieve.children = [retrieve_sem, retrieve_exp]
-
     graph = RPGGraph(
         root_nodes=[understand, retrieve, rerank, plan, answer],
         meta={"query": (query or ""), "style": "general-evidence-based"},
@@ -258,18 +225,13 @@ def configure_rag_for_context(context_type: str, query: str) -> RPGGraph:
         return build_conversational_rag_graph(query)
     return build_general_rag_graph(query)
 
-# -----------------------------
-# Plugin system
-# -----------------------------
 class RAGPlugin(ABC):
     @abstractmethod
     def get_capabilities(self) -> List[str]:
-        """Return capabilities offered by the plugin"""
         raise NotImplementedError
 
     @abstractmethod
     def execute(self, state: Dict[str, Any], **kwargs) -> Dict[str, Any]:
-        """Execute plugin logic and return partial state update"""
         raise NotImplementedError
 
 class LegalRetrievalPlugin(RAGPlugin):
@@ -284,3 +246,69 @@ class LegalRetrievalPlugin(RAGPlugin):
         if "legal" not in plugins:
             plugins.append("legal")
         return {"retrieval_hints": hints, "plugins": plugins}
+
+# -------------------------------
+# Persistent RPG store & merging
+# -------------------------------
+
+class RPGVersionStore:
+    """
+    JSONL-based per-thread store for persistent RPG versions.
+    File path: <RPG_STORE_DIR or ./.rpg_store>/<thread_id>.jsonl
+    """
+    def __init__(self, root_dir: Optional[str] = None):
+        base = root_dir or os.getenv("RPG_STORE_DIR")
+        if base:
+            self.root = Path(base)
+        else:
+            self.root = Path.cwd() / ".rpg_store"
+        self.root.mkdir(parents=True, exist_ok=True)
+
+    def _file(self, thread_id: str) -> Path:
+        safe = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in (thread_id or "default"))
+        return self.root / f"{safe}.jsonl"
+
+    def load_latest(self, thread_id: str) -> Optional[Dict[str, Any]]:
+        fp = self._file(thread_id)
+        if not fp.exists():
+            return None
+        last = None
+        with fp.open("r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    last = json.loads(line)
+                except Exception:
+                    continue
+        return last
+
+    def save_new(self, thread_id: str, rpg_payload: Dict[str, Any], note: Optional[str] = None) -> Dict[str, Any]:
+        prev = self.load_latest(thread_id) or {}
+        version = int(prev.get("version", 0)) + 1
+        rec = {
+            "version": version,
+            "timestamp": int(time.time()),
+            "note": note or "",
+            "rpg": rpg_payload,
+        }
+        fp = self._file(thread_id)
+        with fp.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        return rec
+
+def merge_rpg(old: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Shallow, deterministic merge:
+    - registry: old <- new (new overrides)
+    - flows: prefer new if present else old
+    - graph.meta: merged (old <- new), roots/components from new
+    """
+    out: Dict[str, Any] = {"graph": {}, "registry": {}, "flows": []}
+    old = old or {}
+    new = new or {}
+    out["registry"] = {**(old.get("registry") or {}), **(new.get("registry") or {})}
+    out["flows"] = (new.get("flows") if new.get("flows") else (old.get("flows") or []))
+    g_old = (old.get("graph") or {})
+    g_new = (new.get("graph") or {})
+    meta = {**(g_old.get("meta") or {}), **(g_new.get("meta") or {})}
+    out["graph"] = {**g_new, "meta": meta}
+    return out

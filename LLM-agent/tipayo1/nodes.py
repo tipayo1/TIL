@@ -1,9 +1,12 @@
-# nodes.py (FIXED & MINIMAL)
+# nodes.py (RPG versioning + subgraph filter + concurrency-safe search)
+
 import os
+import time
 from dotenv import load_dotenv
+
 load_dotenv()
 
-from typing import List, Dict, Optional, Any, Tuple
+from typing import List, Dict, Optional, Any, Tuple, Callable
 from concurrent.futures import ThreadPoolExecutor
 
 from langchain_core.documents import Document
@@ -81,9 +84,9 @@ def _calc_metrics(docs: List[Document], k: int) -> Dict[str, Any]:
     diversity = _source_diversity(docs)
     return {"k": k, "n": n, "avg_score": avg_score, "coverage": coverage, "diversity": diversity}
 
-def _run_vs_search(vs, q: str, k: int) -> List[Tuple[Document, float]]:
+def _run_vs_search(vs, q: str, k: int, meta_filter: Optional[Dict[str, Any]] = None) -> List[Tuple[Document, float]]:
     # execute similarity search in thread pool to avoid blocking event loops
-    fut = _EXEC.submit(vs.similarity_search_with_score, q, k)
+    fut = _EXEC.submit(vs.similarity_search_with_score, q, k, None, meta_filter)
     return fut.result()
 
 def _merge_scored_docs(pairs: List[Tuple[Document, float]], seen: set) -> List[Document]:
@@ -99,11 +102,80 @@ def _merge_scored_docs(pairs: List[Tuple[Document, float]], seen: set) -> List[D
         out.append(d)
     return out
 
+# ---------- RPG persistence helpers ----------
+def _now() -> float:
+    return time.time()
+
+def _merge_rpg_graph(prev: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, Any]:
+    # Minimal, conservative merge: prefer new meta, keep both roots; deduplicate by name
+    prev_roots = {r.get("name"): r for r in (prev.get("roots") or []) if isinstance(r, dict)}
+    new_roots = {r.get("name"): r for r in (new.get("roots") or []) if isinstance(r, dict)}
+    merged_names = list({*prev_roots.keys(), *new_roots.keys()})
+    roots = []
+    for name in merged_names:
+        # new overrides on name collision
+        roots.append(new_roots.get(name) or prev_roots.get(name))
+    meta = dict(prev.get("meta") or {})
+    meta.update(new.get("meta") or {})
+    return {"meta": meta, "roots": roots}
+
+def _update_rpg_versions(state: State, new_graph_dict: Dict[str, Any], note: str) -> Dict[str, Any]:
+    versions = list(state.get("rpg_versions") or [])
+    curr_version = int(state.get("rpg_version") or 0)
+    prev_graph = (state.get("rpg") or {}).get("graph")
+
+    if prev_graph:
+        merged = _merge_rpg_graph(prev_graph, new_graph_dict)
+    else:
+        merged = new_graph_dict
+
+    # append snapshot of previous as versioned history (keep tail N)
+    N = int(os.getenv("RPG_VERSION_HISTORY", "10"))
+    if prev_graph:
+        versions.append({"version": curr_version, "graph": prev_graph, "ts": _now(), "note": "prev"})
+        if len(versions) > N:
+            versions = versions[-N:]
+
+    return {
+        "rpg": {"graph": merged, "registry": (state.get("rpg") or {}).get("registry") or {}, "flows": (state.get("rpg") or {}).get("flows") or []},
+        "rpg_versions": versions,
+        "rpg_version": curr_version + 1,
+        "log": (state.get("log") or []) + [{"phase": "setup", "rpg_version": curr_version + 1, "note": note}],
+    }
+
+# ---------- Subgraph filter ----------
+def _doc_context_ok(doc: Document, ctx: str, q_terms: List[str]) -> bool:
+    md = doc.metadata or {}
+    ext = (md.get("ext") or "").lower()
+    ns_terms = md.get("ns_terms") or []
+
+    if ctx == "legal":
+        # If section terms are present in query, require overlap; else allow legal-friendly formats
+        if q_terms:
+            return any(t in ns_terms for t in q_terms)
+        return ext in [".pdf", ".docx", ".md", ".txt"]
+    if ctx == "technical":
+        return ext in [".py", ".ipynb", ".md", ".rst", ".json", ".yaml", ".yml", ".toml"]
+    if ctx == "conversational":
+        return ext in [".md", ".txt", ".html", ".htm"]
+    return True
+
+def _apply_rpg_subgraph_filter(docs: List[Document], state: State) -> List[Document]:
+    ctx = state.get("context_type") or "general"
+    q = state.get("refined_query") or state.get("query") or ""
+    q_terms = extract_section_terms(q) or []
+    kept: List[Document] = []
+    for d in docs:
+        if _doc_context_ok(d, ctx, q_terms):
+            kept.append(d)
+    return kept
+
 # ---------------- Compose RPG ----------------
 def compose_rpg(state: State) -> Dict[str, Any]:
     q = (_get_question(state) or state.get("refined_query") or state.get("query") or "").strip()
     context_type = _infer_context_type(q)
 
+    # Build fresh RPG by context
     rpg_graph = configure_rag_for_context(context_type, q)
     registry = RAGComponentRegistry().to_dict()
 
@@ -123,23 +195,30 @@ def compose_rpg(state: State) -> Dict[str, Any]:
     path = rpg_graph.suggest_execution_path(state.get("retrieval_metrics") or {})
     schema_issues = unit_test_flow_assertions(_DFM)
 
-    log = (state.get("log") or []) + [{"phase": "setup", "rpg": True, "path": path, "schema_issues": schema_issues}]
-    return {
-        "rpg": {"graph": rpg_graph.to_dict(), "registry": registry, "flows": flows},
+    # RPG versioning: merge with previous + record history
+    base_update = {
         "execution_path": path,
         "retrieval_hints": hints,
         "context_type": context_type,
         "plugins": plugins,
         "phase": "setup",
-        "log": log,
         "flow_violations": state.get("flow_violations") or [],
+    }
+    # Ensure registry/flows are available for new 'rpg'
+    state_prime = {**state, **{"rpg": {"graph": (state.get("rpg") or {}).get("graph"), "registry": registry, "flows": flows}}}
+    vupd = _update_rpg_versions(state_prime, rpg_graph.to_dict(), note="compose")
+
+    log = (vupd.get("log") or []) + [{"phase": "setup", "rpg": True, "path": path, "schema_issues": schema_issues}]
+    return {
+        **base_update,
+        **vupd,
+        "log": log,
     }
 
 # ---------------- Intent parsing ----------------
 def intent_parser(state: State) -> Dict[str, Any]:
     base = _get_question(state)
     prev_q = (state.get("query") or "").strip()
-
     reset_block: Dict[str, Any] = {}
     if base and base != prev_q:
         reset_block = {
@@ -173,27 +252,33 @@ def retrieve_rpg(state: State) -> Dict[str, Any]:
     strategy = hints.get("strategy", "semantic")
     section_boost = bool(hints.get("section_boost"))
 
+    # Build an optional metadata filter from RPG if available (kept minimal here)
+    meta_filter: Optional[Dict[str, Any]] = None
+
     docs: List[Document] = []
     if strategy == "hybrid":
         # run two searches concurrently and merge
         terms = extract_section_terms(q) or []
         expanded_query = (q + " " + " ".join(terms)).strip() if terms else q
-        fut_a = _EXEC.submit(vs.similarity_search_with_score, q, int(k * 0.6))
-        fut_b = _EXEC.submit(vs.similarity_search_with_score, expanded_query, int(k * 0.6))
+        fut_a = _EXEC.submit(vs.similarity_search_with_score, q, int(k * 0.6), None, meta_filter)
+        fut_b = _EXEC.submit(vs.similarity_search_with_score, expanded_query, int(k * 0.6), None, meta_filter)
         pairs = fut_a.result() + fut_b.result()
         seen = set()
         docs = _merge_scored_docs(pairs, seen)
     else:
         # semantic but with legal section boost if requested
-        base_pairs = _run_vs_search(vs, q, k)
+        base_pairs = _run_vs_search(vs, q, k, meta_filter)
         seen = set()
         docs = _merge_scored_docs(base_pairs, seen)
         if section_boost:
             terms = extract_section_terms(q) or []
             if terms:
                 expanded_query = (q + " " + " ".join(terms)).strip()
-                extra_pairs = _run_vs_search(vs, expanded_query, max(4, int(k * 0.5)))
+                extra_pairs = _run_vs_search(vs, expanded_query, max(4, int(k * 0.5)), meta_filter)
                 docs += _merge_scored_docs(extra_pairs, seen)
+
+    # RPG subgraph filter BEFORE prompt injection
+    docs = _apply_rpg_subgraph_filter(docs, state)
 
     metrics = _calc_metrics(docs, k)
     update = {"retrieved_docs": docs, "retrieval_metrics": metrics, "phase": "search"}
@@ -212,11 +297,16 @@ def expand_search(state: State) -> Dict[str, Any]:
 
     base_docs = state.get("retrieved_docs") or []
     k = int((state.get("retrieval_hints") or {}).get("k", 16))
-    pairs = _run_vs_search(vs, expanded, k)
+
+    meta_filter: Optional[Dict[str, Any]] = None
+    pairs = _run_vs_search(vs, expanded, k, meta_filter)
 
     seen = set((d.page_content.strip()[:120], (d.metadata or {}).get("source", "")) for d in base_docs)
     new_docs = _merge_scored_docs(pairs, seen)
+
     merged = list(base_docs) + new_docs
+    # Apply subgraph filter again to expanded set to avoid drift
+    merged = _apply_rpg_subgraph_filter(merged, state)
 
     metrics = _calc_metrics(merged, k)
     update = {"retrieved_docs": merged, "retrieval_metrics": metrics, "phase": "expand"}
@@ -231,11 +321,9 @@ def award_xp(state: State) -> Dict[str, Any]:
     met = state.get("retrieval_metrics") or {}
     xp = int(state.get("xp") or 0)
     fails = int(state.get("fail_count") or 0)
-
     n = int(met.get("n") or 0)
     coverage = float(met.get("coverage") or 0.0)
     diversity = float(met.get("diversity") or 0.0)
-
     delta = 1 + int(coverage * 3) + int(diversity * 2) + (2 if n >= 8 else 0)
     xp += max(1, delta)
     if n == 0:
@@ -247,12 +335,17 @@ def award_xp(state: State) -> Dict[str, Any]:
     except Exception:
         new_path = state.get("execution_path") or []
 
+    # Keep current merged RPG and bump version note=award_xp (no graph change)
+    vupd = _update_rpg_versions(state, (state.get("rpg") or {}).get("graph") or {"meta": {}, "roots": []}, note="award_xp")
+
     update = {
         "xp": xp,
         "fail_count": fails,
         "execution_path": new_path or state.get("execution_path") or [],
         "phase": state.get("phase") or "search",
+        **vupd,
     }
+
     # logging only (branching is handled by graph conditional edges)
     log = (state.get("log") or []) + [{"phase": "search", "xp_award": delta, "xp_total": xp, "path": new_path}]
     update["log"] = log
@@ -291,7 +384,6 @@ def generate_answer(state: State) -> Dict[str, Any]:
     q = state.get("refined_query") or state.get("query") or ""
     docs = state.get("retrieved_docs") or []
     plan = state.get("answer_plan") or []
-
     evid_texts: List[str] = []
     for item in plan[:6]:
         for idx in item.get("evidence", []):
@@ -299,11 +391,9 @@ def generate_answer(state: State) -> Dict[str, Any]:
                 d = docs[idx]
                 src = (d.metadata or {}).get("source") or ""
                 evid_texts.append(f"[{idx}] {src}: {d.page_content[:300]}")
-
     system = SystemMessage(content="답변은 근거 기반으로 간결하게 작성하고, 필요한 경우 근거 색인 번호를 각 문단 끝에 대괄호로 표기하세요.")
     human = HumanMessage(content=f"질문: {q}\n\n근거 후보:\n" + "\n".join(evid_texts))
     resp = llm.invoke([system, human])
     text = getattr(resp, "content", "") if hasattr(resp, "content") else str(resp)
-
     log = (state.get("log") or []) + [{"phase": "answer", "chars": len(text)}]
     return {"answer": text, "phase": "answer", "log": log}

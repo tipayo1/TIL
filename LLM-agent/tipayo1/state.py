@@ -1,4 +1,5 @@
-# state.py (UPDATED)
+# state.py (UPDATED: RPG versioning & validation fields)
+
 from typing import Literal, Optional, Dict, List, Any
 from langgraph.graph import MessagesState
 from langchain_core.documents import Document
@@ -19,13 +20,13 @@ class State(MessagesState, total=False):
     answer_plan: List[Dict[str, Any]]  # [{"claim": str, "evidence": [int]}]
     answer: str
 
-    # RPG형 진행상태/경험치/로그
+    # 진행상태/경험치/로그
     phase: Literal["setup", "refine", "search", "expand", "rerank", "plan", "answer", "end"]
     xp: int
     fail_count: int
     log: List[Dict[str, Any]]
 
-    # NEW: RPG/Composability
+    # RPG core
     rpg: Dict[str, Any]  # {"graph": {...}, "registry": {...}, "flows": [...]}
     execution_path: List[str]  # ["intent_parser", "retrieve_rpg", ...]
     plugins: List[str]  # 활성화된 플러그인 식별자
@@ -33,3 +34,7 @@ class State(MessagesState, total=False):
     # NEW: Context & validation
     context_type: Literal["general", "legal", "technical", "conversational"]
     flow_violations: List[Dict[str, Any]]
+
+    # NEW: RPG persistence/versioning
+    rpg_versions: List[Dict[str, Any]]  # [{ "version": int, "graph": {...}, "ts": float, "note": str }]
+    rpg_version: int  # current version counter

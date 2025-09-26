@@ -1,4 +1,5 @@
-# db.py (UNCHANGED EXCEPT SMALL COMMENTS)
+# db.py (Router LLM 분리 + VectorStore 시그니처 호환 어댑터)
+
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -11,26 +12,18 @@ from typing import List, Dict, Optional, Any, Union
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_pinecone import PineconeVectorStore
 
-# 선택사항: pinecone SDK (필요 시)
 try:
     from pinecone import Pinecone, ServerlessSpec  # type: ignore
 except Exception:
     Pinecone = None
     ServerlessSpec = None
 
-# 문서/청크 유틸
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-# --------------------------------
-# 경로/변경감지 유틸
-# --------------------------------
 _ALLOWED_EXTS = [".txt", ".md", ".pdf", ".docx", ".html", ".htm", ".pptx"]
 
 def _candidate_db_dirs() -> List[Path]:
-    """
-    DB_DIR(환경변수) -> CWD/db -> <이 파일 폴더>/../db 우선순위로 후보 디렉터리를 반환
-    """
     cands: List[Path] = []
     env_dir = os.getenv("DB_DIR")
     if env_dir:
@@ -41,9 +34,6 @@ def _candidate_db_dirs() -> List[Path]:
     return cands
 
 def resolve_db_dir(create_if_missing: bool = False) -> Optional[Path]:
-    """
-    사용 가능한 db 디렉터리를 찾는다. 없고 create_if_missing=True이면 기본 위치에 생성.
-    """
     for p in _candidate_db_dirs():
         if p.exists() and p.is_dir():
             return p
@@ -67,9 +57,6 @@ def _scan_files(dir_path: Path) -> List[str]:
     return out
 
 def _fingerprint_paths(paths: List[str]) -> str:
-    """
-    파일 경로 + 수정시각 + 크기로 변경 지문을 계산
-    """
     h = hashlib.sha1()
     for p in paths:
         try:
@@ -79,9 +66,6 @@ def _fingerprint_paths(paths: List[str]) -> str:
             h.update(f"{p}:NA".encode("utf-8"))
     return h.hexdigest()
 
-# --------------------------------
-# 포맷별 로더
-# --------------------------------
 def _load_txt(path: str) -> List[Document]:
     try:
         from langchain_community.document_loaders import TextLoader
@@ -98,7 +82,6 @@ def _load_md(path: str) -> List[Document]:
         return _load_txt(path)
 
 def _load_pdf(path: str) -> List[Document]:
-    # 가벼운 순서: pdfplumber -> pypdf -> pymupdf
     try:
         from langchain_community.document_loaders import PDFPlumberLoader
         return PDFPlumberLoader(path).load()
@@ -142,9 +125,6 @@ def _load_pptx(path: str) -> List[Document]:
     except Exception:
         return _load_txt(path)
 
-# --------------------------------
-# 경로 순회/로딩
-# --------------------------------
 def _iter_paths(path: str) -> List[str]:
     if os.path.isdir(path):
         out: List[str] = []
@@ -178,18 +158,16 @@ def load_documents_from_paths(paths: Union[str, List[str]]) -> List[Document]:
             else:
                 continue
             for d in got:
-                # 표준화된 메타데이터
                 d.metadata = (d.metadata or {})
                 d.metadata.setdefault("source", fp)
                 d.metadata.setdefault("ext", ext)
-                docs.append(d)  # BUGFIX 유지
+                docs.append(d)
     return docs
 
 import re as _re
 _section_pat = _re.compile(r"(제\s*\d+\s*조|별표\s*\d+\s*호|부칙|총칙|정의)")
 
 def extract_section_terms(text: str) -> List[str]:
-    """질문/정제질의에서 규정 섹션 토큰 추출"""
     if not text:
         return []
     hits = _section_pat.findall(text)
@@ -218,9 +196,6 @@ def _doc_ids(docs: List[Document]) -> List[str]:
         ids.append(hashlib.sha1(basis.encode("utf-8")).hexdigest())
     return ids
 
-# --------------------------------
-# Pinecone 및 임베딩
-# --------------------------------
 def _ensure_pinecone_index(pc: Any, index_name: str):
     if pc is None:
         return
@@ -237,22 +212,22 @@ def _ensure_pinecone_index(pc: Any, index_name: str):
                 ),
             )
     except Exception:
-        # 이미 존재하거나 권한문제 등은 조용히 무시
         pass
 
 def get_llm(role: str = "gen") -> ChatOpenAI:
     """
     role:
     - "gen": 본문 생성/분석
-    환경변수: GEN_LLM, OPENAI_API_KEY
+    - "router": 라우팅/분류 등 경량 추론
+    환경변수: GEN_LLM, ROUTER_LLM, GEN_TEMPERATURE, OPENAI_API_KEY
     """
-    model = os.getenv("GEN_LLM", "gpt-4.1")
+    if role == "router":
+        model = os.getenv("ROUTER_LLM", os.getenv("GEN_LLM", "gpt-4o-mini"))
+    else:
+        model = os.getenv("GEN_LLM", "gpt-4.1")
     temperature = float(os.getenv("GEN_TEMPERATURE", "0.2"))
     return ChatOpenAI(model=model, temperature=temperature)
 
-# --------------------------------
-# 전역 캐시(변경 지문/VectorStore)...
-# --------------------------------
 _VECTORSTORE_CACHE: Dict[str, Dict[str, Any]] = {}
 
 def _get_cached_vs(index_name: str) -> Optional[PineconeVectorStore]:
@@ -261,7 +236,7 @@ def _get_cached_vs(index_name: str) -> Optional[PineconeVectorStore]:
         return cache.get("vs")
     return None
 
-def _set_cached_vs(index_name: str, vs: PineconeVectorStore, fp: Optional[str]) -> None:
+def _set_cached_vs(index_name: str, vs: Any, fp: Optional[str]) -> None:
     _VECTORSTORE_CACHE[index_name] = {"vs": vs, "fp": fp}
 
 def _get_cached_fp(index_name: str) -> Optional[str]:
@@ -270,19 +245,27 @@ def _get_cached_fp(index_name: str) -> Optional[str]:
         return cache.get("fp")
     return None
 
-# --------------------------------
-# VectorStore 팩토리 + 자동 부트스트랩
-# --------------------------------
+class _VSAdapter:
+    """
+    PineconeVectorStore 호환 어댑터: nodes.py의 (q, k, None, meta_filter) 호출을 안전하게 수용.
+    """
+    def __init__(self, inner: PineconeVectorStore):
+        self._inner = inner
+
+    def __getattr__(self, name: str):
+        return getattr(self._inner, name)
+
+    def similarity_search_with_score(self, query: str, k: int, namespace=None, meta_filter=None):
+        # meta_filter를 filter 키워드로 전달, namespace는 그대로 위임
+        return self._inner.similarity_search_with_score(
+            query, k, filter=meta_filter, namespace=namespace
+        )
+
 def get_vectorstore(
     index_name: str = "iitp-regulations",
     file_paths: Optional[Union[str, List[str]]] = None,
     auto_bootstrap: bool = True,
-) -> PineconeVectorStore:
-    """
-    PineconeVectorStore 핸들 생성 또는 연결 및 (선택) 부트스트랩 인덱싱
-    - file_paths가 없으면 환경변수(DOCS_PATH|DOCS_DIR|DATA_PATH) 또는 병렬 'db' 폴더를 자동 탐지
-    - 'db' 폴더 내 변경사항(fingerprint) 감지 시에만 재인덱싱 수행
-    """
+):
     api_key = os.getenv("PINECONE_API_KEY")
     if Pinecone is None or not api_key:
         raise RuntimeError("Pinecone 설정이 없습니다. PINECONE_API_KEY를 설정하세요.")
@@ -290,16 +273,16 @@ def get_vectorstore(
     _ensure_pinecone_index(pc, index_name)
 
     embeddings = OpenAIEmbeddings(model=os.getenv("EMBED_MODEL", "text-embedding-3-small"))
-
     vs = _get_cached_vs(index_name)
     if vs is None:
         vs = PineconeVectorStore(index_name=index_name, embedding=embeddings, text_key="text")
+        # 시그니처 호환 어댑터 적용
+        vs = _VSAdapter(vs)
         _set_cached_vs(index_name, vs, None)
 
     if not auto_bootstrap:
         return vs
 
-    # 우선순위: 인자 file_paths -> 환경변수 -> db 폴더 자동 발견
     env_paths = os.getenv("DOCS_PATH") or os.getenv("DOCS_DIR") or os.getenv("DATA_PATH")
     paths: Optional[List[str]] = None
     if isinstance(file_paths, str):
@@ -314,7 +297,6 @@ def get_vectorstore(
         if db_dir and db_dir.exists():
             paths = _scan_files(db_dir)
 
-    # 변경 감지 및 인덱싱
     if paths:
         try:
             fp = _fingerprint_paths(paths)
@@ -322,7 +304,6 @@ def get_vectorstore(
             fp = None
         prev_fp = _get_cached_fp(index_name)
         if fp and prev_fp and fp == prev_fp:
-            # 변경 없음 -> 스킵
             return vs
 
         docs = load_documents_from_paths(paths)
@@ -330,12 +311,11 @@ def get_vectorstore(
         chunks = _chunk_documents(docs)
         if chunks:
             ids = _doc_ids(chunks)
-            # 핵심 수정: 임베딩/업서트를 소배치로 수행하여 단일 요청 토큰 상한 초과 방지
             batch_size = int(os.getenv("EMBED_BATCH_SIZE", "64"))
             for i in range(0, len(chunks), batch_size):
                 batch_docs = chunks[i : i + batch_size]
                 batch_ids = ids[i : i + batch_size]
+                # 어댑터에는 add_documents 그대로 위임됨
                 vs.add_documents(documents=batch_docs, ids=batch_ids)
             _set_cached_vs(index_name, vs, fp)
-
     return vs
