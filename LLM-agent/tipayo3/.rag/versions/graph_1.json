@@ -3,7 +3,7 @@
   "graph": {
     "meta": {
       "context": "general",
-      "question_len": 26
+      "question_len": 21
     },
     "roots": [
       {
@@ -34,6 +34,6 @@
       }
     ]
   },
-  "ts": 1758878048.998699,
+  "ts": 1758930892.871338,
   "note": "context=general"
 }

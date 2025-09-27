@@ -13,12 +13,18 @@ class State(MessagesState, total=False):
 
     # 검색 힌트/결과
     retrieval_hints: Dict[str, Optional[Any]]
+    # 노드들이 실제로 사용하는 필드 명시 (정합성)
+    documents: List[Document]
     retrieved_docs: List[Document]
     retrieval_metrics: Dict[str, Any]  # {k, n, avg_score, coverage, diversity, intent_coverage, negative_rate, novel_evidence_contrib}
 
     # 증거 계획 및 최종 답변
     answer_plan: List[Dict[str, Any]]  # [{"claim": str, "evidence": [int]}]
     answer: str
+
+    # 인용/출처 표기
+    sources: List[str]                 # 최종 답변에 사용/표시한 고유 출처 목록
+    citation_policy: Dict[str, Any]    # {"enable": bool, "max": int, "inline": bool, "append_section": bool, "label": str}
 
     # 진행상태/경험치/로그
     phase: Literal["setup", "refine", "search", "expand", "rerank", "plan", "answer", "end"]
@@ -27,8 +33,8 @@ class State(MessagesState, total=False):
     log: List[Dict[str, Any]]
 
     # RPG core
-    rpg: Dict[str, Any]  # {"graph": {...}, "registry": {...}, "flows": [...]}
-    execution_path: List[str]  # ["intent_parser", "retrieve_rpg", ...]
+    rpg: Dict[str, Any]               # {"graph": {...}, "registry": {...}, "flows": [...]}
+    execution_path: List[str]         # ["intent_parser","retrieve_rpg",...]
     plugins: List[str]
 
     # Context & validation
@@ -37,11 +43,11 @@ class State(MessagesState, total=False):
 
     # RPG persistence/versioning
     rpg_versions: List[Dict[str, Any]]  # [{ "version": int, "graph": {...}, "ts": float, "note": str }]
-    rpg_version: int  # current version counter
+    rpg_version: int                    # current version counter
 
     # Feature tree / selection
-    feature_tree: Dict[str, Any]  # {"roots":[...]} serialized FeatureTree
-    subtree_choice: Dict[str, Any]  # {"retrieval": "semantic|hybrid|expand", ...}
+    feature_tree: Dict[str, Any]     # {"roots":[...]} serialized FeatureTree
+    subtree_choice: Dict[str, Any]   # {"retrieval": "semantic|hybrid|expand", ...}
 
     # Router fields (kept for compatibility)
     route: Literal["rag", "department", "reject"]
