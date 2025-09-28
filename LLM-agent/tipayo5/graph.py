@@ -1,7 +1,6 @@
 # graph.py
 
 from langgraph.graph import StateGraph, START, END  # type: ignore
-
 from state import State  # type: ignore
 from nodes import (  # type: ignore
     compose_rpg,
@@ -15,6 +14,7 @@ from nodes import (  # type: ignore
 )
 from policy import decide_after_xp  # type: ignore
 from checkpoint_file import FileJSONSaver  # type: ignore
+
 
 def build_app():
     """
@@ -59,4 +59,9 @@ def build_app():
 
     # LangGraph는 compile() 된 앱을 실행 대상으로 사용 (파일 기반 체크포인터 포함)
     app = builder.compile(checkpointer=FileJSONSaver())
+
     return app
+
+
+# LangGraph API가 "./graph.py:graph"로 참조할 수 있도록 최상위에 컴파일된 그래프를 노출
+graph = build_app()

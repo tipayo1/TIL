@@ -1,5 +1,6 @@
 # checkpoint_file.py
-# 초경량 파일 기반 Checkpointer (의존성 0, 동기 전용)
+# - 초경량 파일 기반 Checkpointer (로컬 디버깅 전용)
+# - 스튜디오/클라우드에서는 관리형 Checkpointer 사용 권장
 
 from __future__ import annotations
 
@@ -12,7 +13,7 @@ from langgraph.checkpoint.base import BaseCheckpointSaver, Checkpoint, Checkpoin
 from langchain_core.runnables import RunnableConfig  # type: ignore
 
 def _to_plain_checkpoint(c: Checkpoint) -> Dict[str, Any]:
-    # defaultdict 등을 직렬화 가능한 dict로 정규화
+    # 직렬화 가능 형태로 변환
     return {
         "v": c["v"],
         "ts": c["ts"],
@@ -23,17 +24,17 @@ def _to_plain_checkpoint(c: Checkpoint) -> Dict[str, Any]:
 
 class FileJSONSaver(BaseCheckpointSaver):
     """
-    - JSON 단일 파일에 thread별 체크포인트 목록을 저장
-    - 동시성: 파일 쓰기 최소 보장을 위해 파일 단위 락
-    - 비동기 API는 Base에서 스레드 풀로 위임되어 동기 구현만으로 충분
+    JSON 단일 파일에 thread별 체크포인트 목록 저장.
+    - 파일 락으로 최소 동시성 보장
+    - 보존 개수 제한(max_keep) + 파일 사이즈 회전(max_bytes)
     """
-
-    def __init__(self, path: str = ".rag/checkpoints/rpg.json"):
+    def __init__(self, path: str = ".rag/checkpoints/rpg.json", max_keep: int = 20, max_bytes: int = 2_000_000):
         self.path = Path(path).expanduser()
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._lock = threading.Lock()
+        self.lock = threading.Lock()
+        self.max_keep = max(1, int(max_keep))
+        self.max_bytes = max(200_000, int(max_bytes))  # 200KB 이상
 
-    # 내부 스토리지 형식: { thread_id: [ { "checkpoint": {...} }, ... ] }
     def _read_all(self) -> Dict[str, List[dict]]:
         if not self.path.exists():
             return {}
@@ -44,57 +45,57 @@ class FileJSONSaver(BaseCheckpointSaver):
             return {}
 
     def _write_all(self, data: Dict[str, List[dict]]) -> None:
-        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        tmp = self.path.with_suffix(".tmp")
         with tmp.open("w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False)
+            json.dump(data, f, ensure_ascii=False, indent=2)
         tmp.replace(self.path)
 
     def get_tuple(self, config: RunnableConfig) -> Optional[CheckpointTuple]:
-        conf = (config or {}).get("configurable", {})
-        thread_id: str = conf.get("thread_id", "")
-        thread_ts: Optional[str] = conf.get("thread_ts")
-        with self._lock:
+        thread_id = (config.get("configurable") or {}).get("thread_id", "default")
+        with self.lock:
             data = self._read_all()
-            entries = data.get(thread_id, [])
-            rec = None
-            if thread_ts:
-                for e in entries:
-                    if e["checkpoint"]["ts"] == thread_ts:
-                        rec = e
-                        break
-            else:
-                rec = entries[-1] if entries else None
-            if not rec:
+            arr = data.get(thread_id, [])
+            if not arr:
                 return None
-            chk = rec["checkpoint"]
-            return CheckpointTuple(
-                config={"configurable": {"thread_id": thread_id, "thread_ts": chk["ts"]}},
-                checkpoint=chk,  # plain dict
-                parent_config=None,
+            last = arr[-1]
+            return (
+                last.get("v"),
+                last.get("ts"),
+                last.get("channel_values"),
+                last.get("channel_versions"),
+                last.get("versions_seen"),
+                {},
             )
 
-    def list(self, config: RunnableConfig) -> Iterator[CheckpointTuple]:
-        conf = (config or {}).get("configurable", {})
-        thread_id: str = conf.get("thread_id", "")
-        with self._lock:
+    def put(self, config: RunnableConfig, checkpoint: Checkpoint) -> None:
+        thread_id = (config.get("configurable") or {}).get("thread_id", "default")
+        with self.lock:
             data = self._read_all()
-            for e in data.get(thread_id, []):
-                chk = e["checkpoint"]
-                yield CheckpointTuple(
-                    config={"configurable": {"thread_id": thread_id, "thread_ts": chk["ts"]}},
-                    checkpoint=chk,
-                    parent_config=None,
-                )
-
-    def put(self, config: RunnableConfig, checkpoint: Checkpoint) -> RunnableConfig:
-        conf = (config or {}).get("configurable", {})
-        thread_id: str = conf.get("thread_id", "")
-        normalized = _to_plain_checkpoint(checkpoint)
-        with self._lock:
-            data = self._read_all()
-            data.setdefault(thread_id, []).append({"checkpoint": normalized})
+            arr = data.get(thread_id, [])
+            arr.append(_to_plain_checkpoint(checkpoint))
+            # 보존 개수 제한
+            if len(arr) > self.max_keep:
+                arr = arr[-self.max_keep :]
+            data[thread_id] = arr
             self._write_all(data)
-        new_conf = dict(config or {})
-        new_conf.setdefault("configurable", {})
-        new_conf["configurable"].update({"thread_id": thread_id, "thread_ts": normalized["ts"]})
-        return new_conf
+
+            # 사이즈 회전 (너무 커지면 절반만 유지)
+            if self.path.exists() and self.path.stat().st_size > self.max_bytes:
+                data = self._read_all()
+                for k in list(data.keys()):
+                    data[k] = data[k][-max(1, self.max_keep // 2) :]
+                self._write_all(data)
+
+    # 선택 구현: iterator (필요 시)
+    def list(self, config: RunnableConfig) -> Iterator[CheckpointTuple]:
+        thread_id = (config.get("configurable") or {}).get("thread_id", "default")
+        data = self._read_all()
+        for it in data.get(thread_id, []):
+            yield (
+                it.get("v"),
+                it.get("ts"),
+                it.get("channel_values"),
+                it.get("channel_versions"),
+                it.get("versions_seen"),
+                {},
+            )

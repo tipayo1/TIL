@@ -1,62 +1,59 @@
-# state.py (RPG: versioning & validation & feature tree)
+# state.py
+# - LangGraph MessagesState 확장 + Annotated 리듀서 적용
+# - RPG-Lite 신호(전략·온톨로지·정책·흐름)를 상태로 내재화
 
 from typing import Literal, Optional, Dict, List, Any
+from typing import Annotated
+import operator
+
 from langgraph.graph import MessagesState
 from langchain_core.documents import Document
 
 class State(MessagesState, total=False):
-    """RPG 내재화형 RAG 상태"""
+    """
+    RPG-Lite 내재화형 RAG 상태.
 
-    # 사용자 질문/정제 질의
+    - 질의/정제 질의, 검색 힌트, 템플릿/온톨로지 힌트
+    - 검색 결과/메트릭, 단계 계획/최종 답변/출처
+    - 라우팅/학습 신호(xp), 로그, 실행 경로
+    """
+
+    # 입력/전처리
     query: str
     refined_query: str
 
-    # 검색 힌트/결과
+    # 검색 힌트/전략 파라미터 (k, weights, filters 등)
     retrieval_hints: Dict[str, Optional[Any]]
-    # 노드들이 실제로 사용하는 필드 명시 (정합성)
-    documents: List[Document]
-    retrieved_docs: List[Document]
-    retrieval_metrics: Dict[str, Any]  # {k, n, avg_score, coverage, diversity, intent_coverage, negative_rate, novel_evidence_contrib}
 
-    # 증거 계획 및 최종 답변
+    # 템플릿/온톨로지 힌트
+    template_hints: Dict[str, Any]
+    ontology_version: str
+    ontology_entities: Dict[str, Any]  # {"entities": [...], "domain": "..."}
+
+    # 검색 결과/메트릭
+    retrieved_docs: List[Document]
+    retrieval_metrics: Dict[str, Any]  # {k, n, avg_score, coverage, diversity, intent_coverage, negative_rate, novel_evidence_contrib, ontology_coverage}
+
+    # 계획/응답/출처
     answer_plan: List[Dict[str, Any]]  # [{"claim": str, "evidence": [int]}]
     answer: str
+    sources: List[str]
+    citation_policy: Dict[str, Any]  # {"enable": bool, "max": int, "inline": bool, "append_section": bool, "label": str}
 
-    # 인용/출처 표기
-    sources: List[str]                 # 최종 답변에 사용/표시한 고유 출처 목록
-    citation_policy: Dict[str, Any]    # {"enable": bool, "max": int, "inline": bool, "append_section": bool, "label": str}
-
-    # 진행상태/경험치/로그
+    # 진행/학습/로그
     phase: Literal["setup", "refine", "search", "expand", "rerank", "plan", "answer", "end"]
     xp: int
+    xp_total: float
     fail_count: int
-    log: List[Dict[str, Any]]
+    log: Annotated[List[Dict[str, Any]], operator.add]  # 누적
+    # RPG 메타 (경량): 버전/레지스트리 스냅샷/흐름 로그
+    rpg: Dict[str, Any]  # {"version": str, "registry": {...}, "flows": [...]}
 
-    # RPG core
-    rpg: Dict[str, Any]               # {"graph": {...}, "registry": {...}, "flows": [...]}
-    execution_path: List[str]         # ["intent_parser","retrieve_rpg",...]
-    plugins: List[str]
+    # Studio 가시화용 실행 경로 누적
+    execution_path: Annotated[List[str], operator.add]
 
-    # Context & validation
-    context_type: Literal["general", "legal", "technical", "conversational"]
-    flow_violations: List[Dict[str, Any]]
+    # 관측/중복 방지
+    seen_doc_ids: Annotated[List[str], operator.add]
 
-    # RPG persistence/versioning
-    rpg_versions: List[Dict[str, Any]]  # [{ "version": int, "graph": {...}, "ts": float, "note": str }]
-    rpg_version: int                    # current version counter
-
-    # Feature tree / selection
-    feature_tree: Dict[str, Any]     # {"roots":[...]} serialized FeatureTree
-    subtree_choice: Dict[str, Any]   # {"retrieval": "semantic|hybrid|expand", ...}
-
-    # Router fields (kept for compatibility)
-    route: Literal["rag", "department", "reject"]
-    department_info: Dict[str, str]
-    final_answer: str
-    answer_type: Literal["rag_answer", "department_contact", "reject"]
-
-    # Testing / CI-lite
-    test_results: Dict[str, Any]
-
-    # Threading / persistence key
-    thread_id: str
+    # 선택적 FeatureTree 경량 프로필 (도메인·전략·임계값)
+    feature_tree_lite: Dict[str, Any]

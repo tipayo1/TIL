@@ -1,52 +1,16 @@
-# rpg.py (minimal but complete)
+# rpg.py
+# - RPG-Lite: 레지스트리(전략)·템플릿·온톨로지·툴 플러그인
+# - 실행 경로에서 쓰는 최소 필드만 유지
 
 from __future__ import annotations
 
 import os
-import json
-import time
-import random
-from pathlib import Path
+import re
+import importlib
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Any, Tuple, Callable
+from typing import List, Dict, Optional, Any, Callable
 
-from policy import need_expand, COVERAGE_TH, DIVERSITY_TH, EPSILON  # thresholds
-
-
-def _float_env(name: str, default: float) -> float:
-    try:
-        return float(os.getenv(name, str(default)))
-    except Exception:
-        return default
-
-
-def _load_json_env(name: str) -> Optional[dict]:
-    raw = os.getenv(name)
-    if not raw:
-        return None
-    try:
-        return json.loads(raw)
-    except Exception:
-        return None
-
-
-DEFAULT_PATH: List[str] = json.loads(
-    os.getenv(
-        "RPG_DEFAULT_PATH",
-        '["intent_parser","retrieve_rpg","rerank","plan_answer","generate_answer"]',
-    )
-)
-
-
-def _prune_meta(meta: Dict[str, Any], max_kv: int = 32) -> Dict[str, Any]:
-    out: Dict[str, Any] = {}
-    for k, v in (meta or {}).items():
-        if isinstance(v, (str, int, float, bool)) and len(str(v)) < 500 and len(out) < max_kv:
-            out[k] = v
-    return out
-
-
-# ---------------- Feature Tree ----------------
+# ---------------- Feature Tree (경량 프로필) ----------------
 
 @dataclass(slots=True)
 class FeatureTreeNode:
@@ -65,7 +29,6 @@ class FeatureTreeNode:
             "children": [c.to_dict() for c in self.children],
         }
 
-
 class FeatureTree:
     def __init__(self, roots: Optional[List[FeatureTreeNode]] = None):
         self.roots: List[FeatureTreeNode] = roots or []
@@ -73,241 +36,164 @@ class FeatureTree:
     def to_dict(self) -> Dict[str, Any]:
         return {"roots": [r.to_dict() for r in self.roots]}
 
-    def _best_child(self, node: FeatureTreeNode) -> Optional[FeatureTreeNode]:
-        if not node.children:
-            return None
-        return sorted(node.children, key=lambda c: c.score, reverse=True)[0]
-
-    def epsilon_greedy(self, node: FeatureTreeNode, eps: float = 0.1) -> Optional[FeatureTreeNode]:
-        if not node.children:
-            return None
-        if random.random() < max(0.0, min(1.0, eps)):
-            return random.choice(node.children)
-        return self._best_child(node)
-
-
-# ---------------- RPG graph ----------------
-
-@dataclass(slots=True)
-class RPGNode:
-    name: str
-    node_type: str  # "capability" | "component" | "function"
-    children: List["RPGNode"] = field(default_factory=list)
-    dependencies: List[str] = field(default_factory=list)
-    data_flows: List[Dict[str, Any]] = field(default_factory=list)
-    meta: Dict[str, Any] = field(default_factory=dict)  # includes feature_id/file_hint
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "name": self.name,
-            "type": self.node_type,
-            "dependencies": list(self.dependencies),
-            "data_flows": list(self.data_flows),
-            "meta": _prune_meta(dict(self.meta)),
-            "children": [c.to_dict() for c in self.children],
-        }
-
-
-@dataclass(slots=True)
-class RPGGraph:
-    root_nodes: List[RPGNode] = field(default_factory=list)
-    meta: Dict[str, Any] = field(default_factory=dict)
-
-    def add_root(self, node: RPGNode) -> None:
-        self.root_nodes.append(node)
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {"meta": _prune_meta(dict(self.meta)), "roots": [r.to_dict() for r in self.root_nodes]}
-
-    def suggest_execution_path(self, metrics: Optional[Dict[str, Any]] = None) -> List[str]:
-        m = metrics or {}
-        path = ["intent_parser", "retrieve_rpg"]
-        if need_expand(m):
-            path.append("expand_search")
-        path += ["rerank", "plan_answer", "generate_answer"]
-        return path
-
-
-# ---------------- Registry & binding ----------------
+# ---------------- Registry ----------------
 
 class RAGComponentRegistry:
+    """
+    검색/리랭크/생성 전략을 주입식으로 관리하는 레지스트리.
+    - 서비스/도메인별 JSON 오버라이드로 무중단 교체 가능
+    """
     def __init__(self):
-        self.retrieval_strategies: Dict[str, Dict[str, Any]] = {
-            "semantic": {"name": "semantic", "k": 8},
-            "expand": {"name": "expand", "k": 16},
-            "hybrid": {"name": "hybrid", "k": 12, "bm25_weight": 0.4, "dense_weight": 0.6},
-            "legal": {"name": "legal", "k": 12, "section_boost": True},
-            "technical": {"name": "technical", "k": 10, "code_boost": True},
-            "conversational": {"name": "conversational", "k": 8, "history_boost": True},
+        self.retrievers: Dict[str, Dict[str, Any]] = {
+            "semantic": {"k": 6, "weight": 1.0},
+            "hybrid": {"k": 8, "weight_dense": 0.7, "weight_sparse": 0.3},
+            "expand": {"k": 12, "diversity_boost": True},
         }
+        # reranker: 기본 overlap, 경량 CE 옵션(lite_ce) + 환경변수 모델 토글
         self.rerankers: Dict[str, Dict[str, Any]] = {
-            "cross_encoder": {"name": "cross_encoder"},
-            "none": {"name": "none"},
-            "llm_based": {"name": "llm_based"},
+            "none": {"type": "none"},
+            "overlap": {"type": "overlap"},
+            "lite_ce": {
+                "type": "cross_encoder",
+                "model": os.getenv("RERANK_CE_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2"),
+                "batch_size": int(os.getenv("RERANK_CE_BATCH_SIZE", "16")),
+                "topn": int(os.getenv("RERANK_TOPN", "10")),
+            },
         }
         self.generators: Dict[str, Dict[str, Any]] = {
-            "evidence_based": {"name": "evidence_based"},
-            "template": {"name": "template"},
-            "cot": {"name": "chain_of_thought"},
-        }
-        self.feature_to_module: Dict[str, str] = {
-            "retrieval.semantic": "retrievers/semantic.py",
-            "retrieval.hybrid": "retrievers/hybrid.py",
-            "retrieval.expand": "retrievers/expand.py",
-            "retrieval.legal": "retrievers/legal.py",
-            "rerank.cross_encoder": "rerankers/cross_encoder.py",
-            "rerank.llm_based": "rerankers/llm_based.py",
-            "generator.evidence_based": "generators/evidence.py",
-            "generator.template": "generators/template.py",
-            "generator.cot": "generators/cot.py",
+            "default": {"style": "concise", "citations": True},
         }
 
-        if (ov := _load_json_env("RAG_STRATEGIES_JSON")):
-            self.retrieval_strategies.update(ov.get("retrieval", {}))
-            self.rerankers.update(ov.get("rerankers", {}))
-            self.generators.update(ov.get("generators", {}))
-
-        if (ov2 := _load_json_env("FEATURE_TO_MODULE_JSON")):
-            self.feature_to_module.update(ov2)
-
-    def merge_feature_hints(self, hints: Dict[str, Any]) -> Dict[str, Any]:
-        out = dict(hints or {})
-        strat = out.get("strategy", "semantic")
-        rer = out.get("reranker", "cross_encoder")
-        gen = out.get("generator", "evidence_based")
-        features = [f"retrieval.{strat}", f"rerank.{rer}", f"generator.{gen}"]
-        file_hints = [self.feature_to_module.get(f) for f in features if f in self.feature_to_module]
-        out["feature_ids"] = features
-        if file_hints:
-            out["file_hints"] = [fh for fh in file_hints if fh]
-        return out
-
-    def to_dict(self) -> Dict[str, Any]:
+    def snapshot(self) -> Dict[str, Any]:
         return {
-            "retrieval": self.retrieval_strategies,
+            "retrievers": self.retrievers,
             "rerankers": self.rerankers,
             "generators": self.generators,
-            "feature_to_module": self.feature_to_module,
         }
 
-
-def bind_registry_to_hints(registry: Dict[str, Any], context_type: str, base_hints: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    hints = dict(base_hints or {})
-    retr_map = registry.get("retrieval", {})
-    rer_map = registry.get("rerankers", {})
-    gen_map = registry.get("generators", {})
-
-    if context_type == "legal":
-        chosen = retr_map.get("legal") or retr_map.get("hybrid") or retr_map.get("semantic")
-        rer = rer_map.get("cross_encoder")
-        gen = gen_map.get("evidence_based")
-    elif context_type == "technical":
-        chosen = retr_map.get("technical") or retr_map.get("hybrid") or retr_map.get("semantic")
-        rer = rer_map.get("llm_based") or rer_map.get("cross_encoder")
-        gen = gen_map.get("evidence_based")
-    elif context_type == "conversational":
-        chosen = retr_map.get("conversational") or retr_map.get("semantic")
-        rer = rer_map.get("none")
-        gen = gen_map.get("template") or gen_map.get("evidence_based")
-    else:
-        chosen = retr_map.get("hybrid") or retr_map.get("semantic")
-        rer = rer_map.get("cross_encoder")
-        gen = gen_map.get("evidence_based")
-
-    if chosen:
-        hints.update({"strategy": chosen.get("name"), "k": chosen.get("k", hints.get("k", 8))})
-        for key in ("bm25_weight", "dense_weight", "section_boost", "code_boost", "history_boost"):
-            if key in chosen:
-                hints[key] = chosen[key]
-    if rer:
-        hints["reranker"] = rer.get("name")
-    if gen:
-        hints["generator"] = gen.get("name")
-    return hints
-
-
-# ---------------- Flow & version store (minimal) ----------------
-
-class DataFlowManager:
+class TemplateRegistry:
+    """
+    프롬프트 템플릿 블록 조합.
+    - 최소 공통 블록만 유지 (표면 축소)
+    """
     def __init__(self):
-        self._pre: List[Callable[[str, str, Dict[str, Any]], Dict[str, Any]]] = []
-        self._allowed: Dict[Tuple[str, str], bool] = {}
+        self.blocks: Dict[str, str] = {
+            "system_base": "You are a helpful assistant. Answer with evidence when available.",
+            "ask_intent": "Rewrite the query for retrieval. Keep core intent and constraints.",
+            "plan_answer": "Break the answer into 2-4 claims and map evidence indices.",
+            "generate_answer": "Write a direct answer. If citations are provided, include them.",
+        }
 
-    def add_preprocess(self, fn: Callable[[str, str, Dict[str, Any]], Dict[str, Any]]):
-        self._pre.append(fn)
+    def get(self, key: str) -> str:
+        return self.blocks.get(key, "")
 
-    def preprocess(self, frm: str, to: str, st: Dict[str, Any]) -> Dict[str, Any]:
-        out = dict(st or {})
-        for fn in self._pre:
-            out = fn(frm, to, out) or out
-        return out
+# ---------------- Ontology ----------------
 
-    def validate(self, frm: str, to: str, snapshot: Dict[str, Any]) -> Dict[str, Any]:
-        # 최소 검증: 항상 ok, 필요시 확장
-        return {"ok": True, "violations": []}
+class OntologyProvider:
+    """
+    간단한 질의 분석으로 must_terms/filters/entities/도메인 힌트 생성.
+    - HR 미니 스키마
+    - Relation은 필터 수준에서 year/section/domain만 경량 반영
+    """
+    HR_SYNONYMS: Dict[str, List[str]] = {
+        "Policy": ["policy", "규정", "지침", "내규"],
+        "Role": ["role", "직무", "직책", "역할"],
+        "Employee": ["employee", "사원", "직원", "근로자"],
+        "Department": ["department", "부서", "팀"],
+        "Document": ["document", "문서", "자료"],
+        "Contract": ["contract", "계약", "근로계약"],
+        "Recruiting": ["recruit", "채용", "모집"],
+        "Leave": ["leave", "휴가", "휴직"],
+        "Compensation": ["compensation", "연봉", "보상", "급여", "임금"],
+        "Performance": ["performance", "성과", "평가"],
+    }
 
+    def analyze(self, query: str) -> Dict[str, Any]:
+        must_terms: List[str] = []
+        filters: Dict[str, Any] = {}
+        entities: List[str] = []
+        ql = (query or "").lower()
 
-def merge_rpg(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
-    out = dict(a or {})
-    for k, v in (b or {}).items():
-        if k not in out:
-            out[k] = v
-    return out
+        # 연도
+        years = re.findall(r"(20\d{2})", query or "")
+        if years:
+            filters["year"] = max(years)
 
+        # 섹션/도메인 추정
+        if any(w in ql for w in ["policy", "규정", "지침", "내규"]):
+            filters["section"] = "policy"
+        if any(w in ql for w in ["hr", "인사", "채용", "보상", "휴가", "평가"]):
+            filters["domain"] = "hr"
 
-class RPGVersionStore:
-    def __init__(self, root_dir: Optional[str] = None):
-        self.root = Path(root_dir or ".rag/versions")
-        self.root.mkdir(parents=True, exist_ok=True)
-        self._counter = 0
+        # 엔티티/개념 매칭
+        for ent, syns in self.HR_SYNONYMS.items():
+            if any(s.lower() in ql for s in syns):
+                entities.append(ent)
 
-    def save(self, graph: Dict[str, Any], note: str = "") -> int:
-        self._counter += 1
-        rec = {"version": self._counter, "graph": graph, "ts": time.time(), "note": note}
-        path = self.root / f"graph_{self._counter}.json"
-        path.write_text(json.dumps(rec, ensure_ascii=False, indent=2), encoding="utf-8")
-        return self._counter
+        # 핵심 단어를 must로 (최대 5개)
+        tokens = [t for t in re.split(r"[^a-zA-Z0-9가-힣]+", query or "") if len(t) >= 2]
+        if tokens:
+            must_terms.extend(tokens[:5])
 
+        return {
+            "must_terms": must_terms,
+            "filters": filters,
+            "entities": sorted(list(set(entities))),
+            "ontology_version": "hr-lite-v0.2",
+            "domain": filters.get("domain", "general"),
+        }
 
-def configure_rag_for_context(context_type: str, question: str) -> RPGGraph:
-    g = RPGGraph(meta={"context": context_type, "question_len": len(question or "")})
-    retr = RPGNode("retrieval", "capability", meta={"context": context_type})
-    rer = RPGNode("rerank", "capability")
-    gen = RPGNode("generate", "capability")
-    g.add_root(retr)
-    g.add_root(rer)
-    g.add_root(gen)
-    return g
+# ---------------- Registry ↔ Hints 바인딩 ----------------
 
+def bind_registry_to_hints(registry: RAGComponentRegistry, hints: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    레지스트리 기본값을 hints에 병합(기존 hints 우선).
+    """
+    merged = dict(hints or {})
+    # 최소 기본 전략
+    merged.setdefault("strategy", "hybrid")
+    strat = merged["strategy"]
+    merged.setdefault("params", dict(registry.retrievers.get(strat, {"k": 8})))
+    # rerank 기본
+    merged.setdefault("rerank", "overlap")
+    merged.setdefault("rerank_params", dict(registry.rerankers.get(merged["rerank"], {"type": "overlap"})))
+    # generator 기본
+    merged.setdefault("generator", "default")
+    merged.setdefault("generator_params", dict(registry.generators.get("default", {})))
+    # 온톨로지 힌트 직렬 반영
+    merged.setdefault("filters", hints.get("filters", {}))
+    merged.setdefault("must_terms", hints.get("must_terms", []))
+    return merged
 
-def unit_test_flow_assertions(state: Dict[str, Any]) -> Dict[str, Any]:
-    # 최소 테스트 훅 (확장 가능)
-    return {"ok": True}
+# ---------------- Prompt 유틸 ----------------
 
+def get_prompt(templ: TemplateRegistry, key: str) -> str:
+    return templ.get(key)
 
-# ---------------- Plugin example ----------------
+# ---------------- Tool Plugins ----------------
 
-from abc import ABC, abstractmethod
+def _load_tool(mod_name: str, func: str) -> Optional[Callable]:
+    try:
+        mod = importlib.import_module(mod_name)
+        return getattr(mod, func)
+    except Exception:
+        return None
 
-class RAGPlugin(ABC):
-    @abstractmethod
-    def get_capabilities(self) -> List[str]:
-        raise NotImplementedError
+def call_tool(tool_spec: Dict[str, str], **kwargs) -> Any:
+    """
+    동적 로딩 기반 경량 툴 호출.
+    - {"module": "pkg.mod", "func": "fn"}
+    """
+    fn = _load_tool(tool_spec.get("module", ""), tool_spec.get("func", ""))
+    if not fn:
+        return None
+    return fn(**kwargs)
 
-    @abstractmethod
-    def execute(self, state: Dict[str, Any], **kwargs) -> Dict[str, Any]:
-        raise NotImplementedError
-
-
-class LegalRetrievalPlugin(RAGPlugin):
-    def get_capabilities(self) -> List[str]:
-        return ["legal_document_retrieval", "section_filtering"]
-
-    def execute(self, state: Dict[str, Any], **kwargs) -> Dict[str, Any]:
-        hints = dict(state.get("retrieval_hints") or {})
-        hints["section_boost"] = True
-        hints["k"] = max(12, int(hints.get("k", 10)))
-        plugins = list(state.get("plugins") or [])
-        if "legal" not in plugins:
-            plugins.append("legal")
-        return {"retrieval_hints": hints, "plugins": plugins}
+def suggest_tools_for_context(context: Dict[str, Any]) -> List[Dict[str, str]]:
+    """
+    매우 단순한 컨텍스트 기반 툴 제안.
+    """
+    tools: List[Dict[str, str]] = []
+    if context.get("need_citation"):
+        tools.append({"module": "utils.citation", "func": "citation_check"})
+    return tools

@@ -1,346 +1,172 @@
-# db.py (Router LLM 분리 + VectorStore 시그니처 호환 어댑터)
+# db.py
+# - LLM/Embeddings/VectorStore 어댑터 계층
+# - Pinecone/FAISS/Dummy 인터페이스 통일
+# - overlap 기반 폴백 리랭크 유틸
 
 from dotenv import load_dotenv
 load_dotenv()
 
 import os
-import re
-import hashlib
-from pathlib import Path
-from typing import List, Dict, Optional, Any, Union
+from typing import List, Dict, Optional, Any, Tuple
 
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain_pinecone import PineconeVectorStore
+from langchain_core.documents import Document
 
+# Pinecone (optional)
 try:
-    from pinecone import Pinecone, ServerlessSpec  # type: ignore
+    from pinecone import Pinecone  # type: ignore
+    from langchain_pinecone import PineconeVectorStore
 except Exception:
     Pinecone = None
-    ServerlessSpec = None
+    PineconeVectorStore = None
 
-from langchain_core.documents import Document
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+# Optional FAISS fallback
+try:
+    from langchain_community.vectorstores import FAISS  # type: ignore
+except Exception:
+    FAISS = None
 
-_ALLOWED_EXTS = [".txt", ".md", ".pdf", ".docx", ".html", ".htm", ".pptx"]
+# ---------------- LLM ----------------
 
+def get_llm(temperature: float = 0.0, role: Optional[str] = None):
+    """
+    환경:
+    - OPENAI_MODEL (default: gpt-4o-mini)
+    - OPENAI_API_KEY
+    """
+    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    api_key = os.getenv("OPENAI_API_KEY", None)
+    kwargs = {"model": model, "temperature": temperature}
+    if api_key:
+        kwargs["api_key"] = api_key  # type: ignore
+    return ChatOpenAI(**kwargs)
 
-def _candidate_db_dirs() -> List[Path]:
-    cands: List[Path] = []
-    env_dir = os.getenv("DB_DIR")
-    if env_dir:
-        cands.append(Path(env_dir))
-    cands.append(Path.cwd() / "db")
-    here = Path(__file__).resolve().parent
-    cands.append(here.parent / "db")
-    return cands
+def get_embeddings():
+    """
+    환경:
+    - EMBED_MODEL (default: text-embedding-3-small)
+    - OPENAI_API_KEY
+    """
+    embed_model = os.getenv("EMBED_MODEL", "text-embedding-3-small")
+    api_key = os.getenv("OPENAI_API_KEY", None)
+    kwargs = {"model": embed_model}
+    if api_key:
+        kwargs["api_key"] = api_key  # type: ignore
+    return OpenAIEmbeddings(**kwargs)
 
+# ---------------- Utilities ----------------
 
-def resolve_db_dir(create_if_missing: bool = False) -> Optional[Path]:
-    for p in _candidate_db_dirs():
-        if p.exists() and p.is_dir():
-            return p
-    if create_if_missing:
-        target = _candidate_db_dirs()[-1]
-        try:
-            target.mkdir(parents=True, exist_ok=True)
-            return target
-        except Exception:
-            return None
-    return None
+def simple_overlap_score(query: str, doc: Document) -> float:
+    """
+    매우 단순한 겹침 스코어(토큰 교집합 비율) — 비용 없는 폴백용
+    """
+    q = set((query or "").lower().split())
+    t = set(((doc.page_content or "")).lower().split())
+    if not q or not t:
+        return 0.0
+    return len(q & t) / float(len(q))
 
+def _metadata_match(md: Dict[str, Any], filt: Dict[str, Any]) -> bool:
+    if not filt:
+        return True
+    md = md or {}
+    for k, v in (filt or {}).items():
+        if isinstance(v, (list, tuple, set)):
+            if md.get(k) not in v:
+                return False
+        else:
+            if md.get(k) != v:
+                return False
+    return True
 
-def _scan_files(dir_path: Path) -> List[str]:
-    out: List[str] = []
-    for root, _, files in os.walk(str(dir_path)):
-        for fn in files:
-            ext = Path(fn).suffix.lower()
-            if ext in _ALLOWED_EXTS:
-                out.append(str(Path(root) / fn))
-    out.sort()
-    return out
+def _must_terms_match(text: str, terms: List[str]) -> bool:
+    if not terms:
+        return True
+    tl = (text or "").lower()
+    return all((t or "").lower() in tl for t in terms)
 
+# ---------------- VectorStore Adapter ----------------
 
-def _fingerprint_paths(paths: List[str]) -> str:
-    h = hashlib.sha1()
-    for p in paths:
-        try:
-            st = os.stat(p)
-            h.update(f"{p}:{st.st_mtime_ns}:{st.st_size}".encode("utf-8"))
-        except Exception:
-            h.update(f"{p}:NA".encode("utf-8"))
-    return h.hexdigest()
+class _AdapterVS:
+    """
+    VectorStore 어댑터: Pinecone/FAISS/Dummy 동일 시그니처
+    - similarity_search_with_score(query, k, filters, must_terms, fetch_k)
+    """
+    def __init__(self, kind: str, store: Any):
+        self.kind = kind
+        self.store = store
 
+    def similarity_search_with_score(
+        self,
+        query: str,
+        k: int = 5,
+        filters: Optional[Dict[str, Any]] = None,
+        must_terms: Optional[List[str]] = None,
+        fetch_k: Optional[int] = None,
+    ) -> List[Tuple[Document, float]]:
+        must_terms = must_terms or []
+        filters = filters or {}
+        if self.kind == "pinecone":
+            pairs = self.store.similarity_search_with_score(query, k=max(k, 1), filter=filters)  # type: ignore
+            filtered = [(d, s) for (d, s) in pairs if _must_terms_match(d.page_content, must_terms)]
+            return filtered[:k]
 
-def _load_txt(path: str) -> List[Document]:
-    try:
-        from langchain_community.document_loaders import TextLoader
-        return TextLoader(path, encoding="utf-8").load()
-    except Exception:
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            return [Document(page_content=f.read(), metadata={"source": path})]
+        if self.kind == "faiss":
+            cand_k = fetch_k if (fetch_k and fetch_k >= k) else max(k * 3, k + 10)
+            pairs = self.store.similarity_search_with_score(query, k=cand_k)  # type: ignore
+            filtered = []
+            for d, s in pairs:
+                if not _metadata_match((d.metadata or {}), filters):
+                    continue
+                if not _must_terms_match(d.page_content, must_terms):
+                    continue
+                filtered.append((d, s))
+            return filtered[:k]
 
-
-def _load_md(path: str) -> List[Document]:
-    try:
-        from langchain_community.document_loaders import UnstructuredMarkdownLoader
-        return UnstructuredMarkdownLoader(path, mode="single").load()
-    except Exception:
-        return _load_txt(path)
-
-
-def _load_pdf(path: str) -> List[Document]:
-    try:
-        from langchain_community.document_loaders import PDFPlumberLoader
-        return PDFPlumberLoader(path).load()
-    except Exception:
-        try:
-            from langchain_community.document_loaders import PyPDFLoader
-            return PyPDFLoader(path).load()
-        except Exception:
-            try:
-                from langchain_community.document_loaders import PyMuPDFLoader
-                return PyMuPDFLoader(path).load()
-            except Exception as e:
-                raise RuntimeError(f"PDF 로딩 실패: {path} ({e})")
-
-
-def _load_docx(path: str) -> List[Document]:
-    try:
-        from langchain_community.document_loaders import Docx2txtLoader
-        return Docx2txtLoader(path).load()
-    except Exception:
-        try:
-            from langchain_community.document_loaders import UnstructuredWordDocumentLoader
-            return UnstructuredWordDocumentLoader(path).load()
-        except Exception:
-            return _load_txt(path)
-
-
-def _load_html(path: str) -> List[Document]:
-    try:
-        from langchain_community.document_loaders import BSHTMLLoader
-        return BSHTMLLoader(path, open_encoding="utf-8").load()
-    except Exception:
-        try:
-            from langchain_community.document_loaders import UnstructuredHTMLLoader
-            return UnstructuredHTMLLoader(path).load()
-        except Exception:
-            return _load_txt(path)
-
-
-def _load_pptx(path: str) -> List[Document]:
-    try:
-        from langchain_community.document_loaders import UnstructuredPowerPointLoader
-        return UnstructuredPowerPointLoader(path).load()
-    except Exception:
-        return _load_txt(path)
-
-
-def _iter_paths(path: str) -> List[str]:
-    if os.path.isdir(path):
-        out: List[str] = []
-        for root, _, files in os.walk(path):
-            for fn in files:
-                ext = os.path.splitext(fn)[1].lower()
-                if ext in _ALLOWED_EXTS:
-                    out.append(os.path.join(root, fn))
-        return out
-    return [path]
-
-
-def load_documents_from_paths(paths: Union[str, List[str]]) -> List[Document]:
-    if isinstance(paths, str):
-        paths = [paths]
-    docs: List[Document] = []
-    for p in paths:
-        for fp in _iter_paths(p):
-            ext = os.path.splitext(fp)[1].lower()
-            if ext == ".txt":
-                got = _load_txt(fp)
-            elif ext == ".md":
-                got = _load_md(fp)
-            elif ext == ".pdf":
-                got = _load_pdf(fp)
-            elif ext == ".docx":
-                got = _load_docx(fp)
-            elif ext in [".html", ".htm"]:
-                got = _load_html(fp)
-            elif ext == ".pptx":
-                got = _load_pptx(fp)
-            else:
-                continue
-            for d in got:
-                d.metadata = (d.metadata or {})
-                d.metadata.setdefault("source", fp)
-                d.metadata.setdefault("ext", ext)
-                docs.append(d)
-    return docs
-
-
-import re as _re
-_section_pat = _re.compile(r"(제\s*\d+\s*조|별표\s*\d+\s*호|부칙|총칙|정의)")
-
-
-def extract_section_terms(text: str) -> List[str]:
-    if not text:
+        # Dummy
         return []
-    hits = _section_pat.findall(text)
-    return [_re.sub(r"\s+", "", h) for h in hits]
 
+    def add_documents(self, docs: List[Document]):
+        if hasattr(self.store, "add_documents"):
+            return self.store.add_documents(docs)  # type: ignore
+        return None
 
-def _annotate_sections(docs: List[Document]) -> List[Document]:
-    for d in docs:
-        terms = extract_section_terms(d.page_content or "")
-        meta = d.metadata or {}
-        meta["ns_terms"] = list({t for t in terms if t})
-        d.metadata = meta
-    return docs
-
-
-def _chunk_documents(docs: List[Document]) -> List[Document]:
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=int(os.getenv("CHUNK_SIZE", "800")),
-        chunk_overlap=int(os.getenv("CHUNK_OVERLAP", "120")),
-        separators=["\n\n", "\n", " ", ""],
-    )
-    return splitter.split_documents(docs)
-
-
-def _doc_ids(docs: List[Document]) -> List[str]:
-    ids: List[str] = []
-    for d in docs:
-        basis = (d.page_content or "") + "|" + (d.metadata.get("source") or "")
-        ids.append(hashlib.sha1(basis.encode("utf-8")).hexdigest())
-    return ids
-
-
-def _ensure_pinecone_index(pc: Any, index_name: str):
-    if pc is None:
-        return
-    try:
-        idx_list = [x["name"] for x in pc.list_indexes()]
-        if index_name not in idx_list and ServerlessSpec is not None:
-            pc.create_index(
-                name=index_name,
-                dimension=int(os.getenv("EMBED_DIM", "1536")),
-                metric="cosine",
-                spec=ServerlessSpec(
-                    cloud=os.getenv("PC_CLOUD", "aws"),
-                    region=os.getenv("PC_REGION", "us-east-1"),
-                ),
-            )
-    except Exception:
-        pass
-
-
-def get_llm(role: str = "gen") -> ChatOpenAI:
+def get_vectorstore(namespace: Optional[str] = None) -> _AdapterVS:
     """
-    role:
-    - "gen": 본문 생성/분석
-    - "router": 라우팅/분류 등 경량 추론
-    환경변수: GEN_LLM, ROUTER_LLM, GEN_TEMPERATURE, OPENAI_API_KEY
+    우선순위: Pinecone -> FAISS -> Dummy
+    환경:
+    - PINECONE_API_KEY / PINECONE_INDEX
+    - FAISS_PATH (옵션)
     """
-    if role == "router":
-        model = os.getenv("ROUTER_LLM", os.getenv("GEN_LLM", "gpt-4o-mini"))
-    else:
-        model = os.getenv("GEN_LLM", "gpt-4.1")
-    temperature = float(os.getenv("GEN_TEMPERATURE", "0.2"))
-    return ChatOpenAI(model=model, temperature=temperature)
-
-
-_VECTORSTORE_CACHE: Dict[str, Dict[str, Any]] = {}
-
-
-def _get_cached_vs(index_name: str) -> Optional[PineconeVectorStore]:
-    cache = _VECTORSTORE_CACHE.get(index_name)
-    if cache:
-        return cache.get("vs")
-    return None
-
-
-def _set_cached_vs(index_name: str, vs: Any, fp: Optional[str]) -> None:
-    _VECTORSTORE_CACHE[index_name] = {"vs": vs, "fp": fp}
-
-
-def _get_cached_fp(index_name: str) -> Optional[str]:
-    cache = _VECTORSTORE_CACHE.get(index_name)
-    if cache:
-        return cache.get("fp")
-    return None
-
-
-class _VSAdapter:
-    """
-    PineconeVectorStore 호환 어댑터: nodes.py의 (q, k, None, meta_filter) 호출을 안전하게 수용.
-    """
-    def __init__(self, inner: PineconeVectorStore):
-        self._inner = inner
-
-    def __getattr__(self, name: str):
-        return getattr(self._inner, name)
-
-    def similarity_search_with_score(self, query: str, k: int, namespace=None, meta_filter=None):
-        # meta_filter를 filter 키워드로 전달, namespace는 그대로 위임
-        return self._inner.similarity_search_with_score(
-            query, k, filter=meta_filter, namespace=namespace
-        )
-
-
-def get_vectorstore(
-    index_name: str = "iitp-regulations",
-    file_paths: Optional[Union[str, List[str]]] = None,
-    auto_bootstrap: bool = True,
-):
-    api_key = os.getenv("PINECONE_API_KEY")
-    if Pinecone is None or not api_key:
-        raise RuntimeError("Pinecone 설정이 없습니다. PINECONE_API_KEY를 설정하세요.")
-    pc = Pinecone(api_key=api_key)
-    _ensure_pinecone_index(pc, index_name)
-
-    embeddings = OpenAIEmbeddings(model=os.getenv("EMBED_MODEL", "text-embedding-3-small"))
-
-    vs = _get_cached_vs(index_name)
-    if vs is None:
-        vs = PineconeVectorStore(index_name=index_name, embedding=embeddings, text_key="text")
-        vs = _VSAdapter(vs)  # 시그니처 호환 어댑터 적용
-        _set_cached_vs(index_name, vs, None)
-
-    if not auto_bootstrap:
-        return vs
-
-    env_paths = os.getenv("DOCS_PATH") or os.getenv("DOCS_DIR") or os.getenv("DATA_PATH")
-    paths: Optional[List[str]] = None
-    if isinstance(file_paths, str):
-        paths = [file_paths]
-    elif isinstance(file_paths, list):
-        paths = file_paths
-    elif env_paths:
-        parts = re.split(r"[;,]", env_paths)
-        paths = [p.strip() for p in parts if p.strip()]
-    else:
-        db_dir = resolve_db_dir(create_if_missing=False)
-        if db_dir and db_dir.exists():
-            paths = _scan_files(db_dir)
-
-    if paths:
+    # Pinecone
+    if Pinecone and PineconeVectorStore and os.getenv("PINECONE_API_KEY"):
         try:
-            fp = _fingerprint_paths(paths)
+            pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
+            _ = pc  # lint
+            index_name = os.getenv("PINECONE_INDEX", "rag-index")
+            emb = get_embeddings()
+            vs = PineconeVectorStore(index_name=index_name, embedding=emb, namespace=namespace or None)
+            return _AdapterVS("pinecone", vs)
         except Exception:
-            fp = None
-        prev_fp = _get_cached_fp(index_name)
-        if fp and prev_fp and fp == prev_fp:
-            return vs
+            pass
 
-        docs = load_documents_from_paths(paths)
-        docs = _annotate_sections(docs)
-        chunks = _chunk_documents(docs)
-        if chunks:
-            ids = _doc_ids(chunks)
-            batch_size = int(os.getenv("EMBED_BATCH_SIZE", "64"))
-            for i in range(0, len(chunks), batch_size):
-                batch_docs = chunks[i: i + batch_size]
-                batch_ids = ids[i: i + batch_size]
-                vs.add_documents(documents=batch_docs, ids=batch_ids)
-            _set_cached_vs(index_name, vs, fp)
+    # FAISS
+    if FAISS:
+        try:
+            faiss_path = os.getenv("FAISS_PATH", "")
+            emb = get_embeddings()
+            if faiss_path and os.path.exists(faiss_path):
+                vs = FAISS.load_local(faiss_path, emb, allow_dangerous_deserialization=True)
+            else:
+                vs = FAISS.from_texts([""], emb)  # 빈 인덱스
+            return _AdapterVS("faiss", vs)
+        except Exception:
+            pass
 
-    return vs
+    # Dummy
+    return _AdapterVS("dummy", object())
+
+# .env 참고(README 권장):
+# - OPENAI_MODEL, OPENAI_API_KEY, EMBED_MODEL
+# - PINECONE_API_KEY, PINECONE_INDEX, FAISS_PATH
+# - RERANK_CE_ENABLE, RERANK_CE_MODEL, RERANK_CE_BATCH_SIZE, RERANK_TOPN

@@ -1,365 +1,349 @@
-# nodes.py (경량 LEGO 블록: compose → intent → retrieve → award_xp → expand|rerank → plan → generate)
+# nodes.py
+# - LEGO 블록 노드: compose → intent → retrieve → award_xp → expand|rerank → plan → generate
+# - 각 노드는 단일 책임, 분기는 policy에서만 수행
+# - execution_path 누적으로 Studio 단계 가시성 확보
+# - 노드 시그니처: (state, config[RunnableConfig]) 선택 도입
 
 import os
-import time
-import json
-import hashlib
 from typing import List, Dict, Optional, Any, Tuple
 
 from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.runnables import RunnableConfig
 
 from state import State
-from db import get_vectorstore, get_llm
-from rpg import configure_rag_for_context, bind_registry_to_hints
+from db import get_vectorstore, get_llm, simple_overlap_score
+from rpg import (
+    RAGComponentRegistry,
+    TemplateRegistry,
+    OntologyProvider,
+    bind_registry_to_hints,
+    get_prompt,
+)
+from policy import need_expand, decide_after_xp
 
 # ---------------- Env / constants ----------------
-_FT_ALPHA = float(os.getenv("RPG_FT_ALPHA", "0.3"))
 _MAX_EXPANDS = int(os.getenv("RPG_MAX_EXPANDS", "3"))
-_USE_UNIT_TEST = os.getenv("RPG_USE_UNIT_TESTS", "0") not in ("0", "false", "False")
-_AB_POLICY = os.getenv("RPG_AB_POLICY", "A")
-_CE_MODEL = os.getenv("RERANK_CE_MODEL", "").strip()
+
+# Optional Sentry hook
+_SENTRY_DSN = os.getenv("SENTRY_DSN", "").strip()
+if _SENTRY_DSN:
+    try:
+        import sentry_sdk  # type: ignore
+        sentry_sdk.init(dsn=_SENTRY_DSN)
+    except Exception:
+        pass
+
+# ---------------- 공통 데코레이터 ----------------
+def trace_node(node_name: str):
+    """
+    - phase 설정, execution_path 누적, 노드 예외 로깅
+    - LangGraph 권장 config 인자 패턴 지원(state, config)
+    - 운영시 Sentry 훅을 통해 예외 보고 가능(옵션)
+    - Command 반환 패턴도 가능하나, 본 구현은 조건부 엣지로 라우팅(그래프에서 관리)
+    """
+    def wrapper(fn):
+        def inner(state: State, config: Optional[RunnableConfig] = None) -> State:
+            state["phase"] = node_name
+            ep = list(state.get("execution_path", []))
+            ep.append(node_name)
+            state["execution_path"] = ep
+            try:
+                if config is None:
+                    return fn(state)
+                # 함수가 config를 받지 않는 경우 안전 폴백
+                try:
+                    return fn(state, config)
+                except TypeError:
+                    return fn(state)
+            except Exception as e:
+                log = list(state.get("log", []))
+                log.append({"node": node_name, "error": str(e)})
+                state["log"] = log
+                state["fail_count"] = int(state.get("fail_count", 0)) + 1
+                if _SENTRY_DSN:
+                    try:
+                        import sentry_sdk  # type: ignore
+                        sentry_sdk.capture_exception(e)
+                    except Exception:
+                        pass
+                raise
+        return inner
+    return wrapper
 
 # ---------------- Helpers ----------------
-def _moving_avg(old: Optional[float], new: float, alpha: float = _FT_ALPHA) -> float:
-    if old is None:
-        return new
-    return alpha * new + (1.0 - alpha) * float(old)
+def _doc_id(doc: Document) -> str:
+    mid = (doc.metadata or {}).get("id")
+    if mid:
+        return str(mid)
+    return str(abs(hash((doc.page_content or "")[:200])))
 
-def _hash_dict(obj: Dict[str, Any]) -> str:
-    norm = json.dumps(obj, sort_keys=True, ensure_ascii=False).encode("utf-8")
-    return hashlib.sha256(norm).hexdigest()
+def _compute_metrics(query: str, docs: List[Document], must_terms: List[str], filters: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    경량 메트릭 집계(coverage/diversity/intent_coverage/negative_rate/ontology_coverage)
+    """
+    if not docs:
+        return {
+            "k": 0, "n": 0, "avg_score": 0.0, "coverage": 0.0, "diversity": 0.0,
+            "intent_coverage": 0.0, "negative_rate": 1.0, "novel_evidence_contrib": 0.0,
+            "ontology_coverage": 0.0
+        }
 
-def _trim_log(log: Optional[List[Dict[str, Any]]], max_len: int = 200) -> List[Dict[str, Any]]:
-    return (log or [])[-max_len:]
+    scores = [simple_overlap_score(query, d) for d in docs]
+    avg = sum(scores) / len(scores) if scores else 0.0
+    sources = [str((d.metadata or {}).get("source", "unknown")) for d in docs]
+    uniq = len(set(sources)) / float(max(1, len(sources)))
+    neg = sum(1 for d in docs if not (d.page_content or "").strip()) / float(len(docs))
 
-def _apply_meta_filter_by_context(ctx: str) -> Optional[Dict[str, Any]]:
-    if ctx == "technical":
-        return {"ext": {"$in": [".py", ".ipynb", ".md", ".rst", ".json", ".yaml", ".yml", ".toml"]}}
-    if ctx == "legal":
-        return {"ext": {"$in": [".pdf", ".docx", ".txt", ".md"]}}
-    return None
+    def _match(d: Document) -> float:
+        text = (d.page_content or "").lower()
+        must_ok = all((t or "").lower() in text for t in (must_terms or [])) if must_terms else True
+        filt_ok = True
+        md = d.metadata or {}
+        for k, v in (filters or {}).items():
+            if isinstance(v, (list, tuple, set)):
+                if md.get(k) not in v:
+                    filt_ok = False
+                    break
+            else:
+                if md.get(k) != v:
+                    filt_ok = False
+                    break
+        return 1.0 if (must_ok and filt_ok) else 0.0
 
-def _run_vs_search(vs, query: str, k: int = 8, meta_filter: Optional[Dict[str, Any]] = None) -> List[Tuple[Document, float]]:
-    try:
-        if meta_filter:
-            docs = vs.similarity_search_with_score(query, k=k, filter=meta_filter)
-        else:
-            docs = vs.similarity_search_with_score(query, k=k)
-    except Exception:
-        docs = vs.similarity_search_with_score(query, k=k)
-    return docs
-
-def _unique_by_source_scored(pairs: List[Tuple[Document, float]], top_k: int = 12) -> List[Tuple[Document, float]]:
-    seen = set()
-    out: List[Tuple[Document, float]] = []
-    for d, s in pairs:
-        src = (d.metadata or {}).get("source") or (d.metadata or {}).get("id") or d.page_content[:50]
-        if src in seen:
-            continue
-        seen.add(src)
-        out.append((d, s))
-        if len(out) >= top_k:
-            break
-    return out
-
-def _boost_with_ns_terms(pairs: List[Tuple[Document, float]], boost: float = 0.03) -> List[Tuple[Document, float]]:
-    """문서 메타의 ns_terms 개수 기반 경량 부스팅."""
-    out: List[Tuple[Document, float]] = []
-    for d, s in pairs:
-        terms = (d.metadata or {}).get("ns_terms") or []
-        inc = len([t for t in terms if t])
-        out.append((d, s + boost * inc))
-    out.sort(key=lambda x: x[1], reverse=True)
-    return out
-
-def _metrics_from_pairs(pairs: List[Tuple[Document, float]], k: int) -> Dict[str, Any]:
-    n = len(pairs)
-    avg = sum(s for _, s in pairs) / max(n, 1)
-    sources = {(d.metadata or {}).get("source", "") for d, _ in pairs}
-    diversity = len(sources) / max(n, 1)
-    coverage = n / max(k, 1)
-    negative_rate = sum(1 for _, s in pairs if s <= 0) / max(n, 1)
+    onto_cov = sum(_match(d) for d in docs) / float(len(docs))
     return {
-        "k": k,
-        "n": n,
+        "k": len(docs),
+        "n": len(docs),
         "avg_score": avg,
-        "coverage": coverage,
-        "diversity": diversity,
-        "intent_coverage": 0.0,
-        "negative_rate": negative_rate,
+        "coverage": avg,
+        "diversity": uniq,
+        "intent_coverage": max(0.0, min(1.0, avg + 0.05)),
+        "negative_rate": neg,
         "novel_evidence_contrib": 0.0,
+        "ontology_coverage": onto_cov,
     }
-
-def _apply_rerank(pairs: List[Tuple[Document, float]], query: str, strategy: Optional[str]) -> List[Tuple[Document, float]]:
-    """
-    경량 리랭커:
-    - strategy가 비어있으면 원 순서 유지
-    - 비용 절감을 위해 외부 모델 호출 없이 현재는 순서 유지
-    """
-    if not strategy or strategy == "none":
-        return pairs
-    # 확장 지점: CE/LLM rerank로 교체 가능
-    return pairs
-
-def _guess_context(q: str) -> str:
-    ql = (q or "").lower()
-    if any(t in q for t in ["법", "조문", "판례", "헌법", "소송", "법률"]):
-        return "legal"
-    if any(t in ql for t in ["stack trace", "exception", "traceback", "def ", "class ", "python", "에러", "오류"]):
-        return "technical"
-    if any(t in q for t in ["안녕", "고마워", "말해줘", "대화", "상담"]):
-        return "conversational"
-    return "general"
 
 # ---------------- Nodes ----------------
-def compose_rpg(state: State) -> Dict[str, Any]:
-    t0 = time.time()
-    q = state.get("query") or ""
-    context_type = state.get("context_type") or _guess_context(q)
-    reg, tpl, onto = configure_rag_for_context(context_type)
 
-    base_hints: Dict[str, Any] = {"k": 8, "must_terms": []}
-    hints = bind_registry_to_hints(reg.to_dict(), context_type, base_hints)
-    hints = onto.enrich(q, hints)
-    subtree_choice = {"retrieval": hints.get("strategy", "hybrid")}
+@trace_node("compose_rpg")
+def compose_rpg(state: State, config: Optional[RunnableConfig] = None) -> State:
+    """
+    - 레지스트리/템플릿/온톨로지 초기화
+    - 온톨로지 분석 → 기본 hints 생성 → 레지스트리 병합
+    - RPG 메타 스냅샷 저장
+    """
+    reg = RAGComponentRegistry()
+    templ = TemplateRegistry()
+    onto = OntologyProvider()
+    q = state.get("query", "") or ""
+    onto_hints = onto.analyze(q)
 
-    # minimal RPG graph/meta
-    rpg_graph = {"meta": {"context": context_type}, "roots": []}
-    rpg = {"graph": rpg_graph, "registry": reg.to_dict(), "flows": ["compose", "intent", "retrieve", "rerank", "generate"]}
-
-    # versioning
-    vnum = int(state.get("rpg_version") or 0) + 1
-    versions = list(state.get("rpg_versions") or [])
-    versions.append({"version": vnum, "graph": rpg_graph, "ts": time.time(), "note": "auto"})
-
-    log = (state.get("log") or []) + [{"phase": "setup", "dt": time.time() - t0, "note": f"ctx={context_type}, strat={hints.get('strategy')}"}]
-    log = _trim_log(log)
-
-    return {
-        "context_type": context_type,
-        "rpg": rpg,
-        "rpg_version": vnum,
-        "rpg_versions": versions,
-        "retrieval_hints": hints,
-        "template_hints": {"domain": context_type},
-        "ontology_version": str(hints.get("ontology_version", "")),
-        "subtree_choice": subtree_choice,
-        "phase": "setup",
-        "execution_path": (state.get("execution_path") or []) + ["compose_rpg"],
-        "log": log,
+    hints = {
+        "must_terms": onto_hints.get("must_terms", []),
+        "filters": onto_hints.get("filters", {}),
+        "strategy": "hybrid",
+        # rerank 기본은 overlap, 필요 시 환경으로 경량 CE 활성화
+        "rerank": "overlap" if not os.getenv("RERANK_CE_ENABLE", "").strip() else "lite_ce",
     }
+    hints = bind_registry_to_hints(reg, hints)
 
-def intent_parser(state: State) -> Dict[str, Any]:
-    t0 = time.time()
-    q = state.get("query") or ""
-    refined = " ".join(q.split()).strip()
-    log = (state.get("log") or []) + [{"phase": "refine", "dt": time.time() - t0, "note": "normalize"}]
-    log = _trim_log(log)
-    return {
-        "refined_query": refined or q,
-        "phase": "refine",
-        "execution_path": (state.get("execution_path") or []) + ["intent_parser"],
-        "log": log,
-    }
+    state["retrieval_hints"] = hints
+    state["template_hints"] = {"style": "concise"}
+    state["ontology_version"] = onto_hints.get("ontology_version", "v0.1-lite")
+    state["ontology_entities"] = {"entities": onto_hints.get("entities", []), "domain": onto_hints.get("domain", "general")}
+    state["rpg"] = {"version": "rpg-lite-0.2", "registry": reg.snapshot(), "flows": []}
 
-def retrieve_rpg(state: State) -> Dict[str, Any]:
-    t0 = time.time()
-    q = state.get("refined_query") or state.get("query") or ""
-    hints = dict(state.get("retrieval_hints") or {})
-    k = int(hints.get("k") or 8)
-    ctx = state.get("context_type") or "general"
-    meta_filter = _apply_meta_filter_by_context(ctx)
+    # 학습/진행/메타 초기화
+    state["xp"] = int(state.get("xp", 0))
+    state["xp_total"] = float(state.get("xp_total", 0.0))
+    state["fail_count"] = int(state.get("fail_count", 0))
+    state["log"] = list(state.get("log", []))
+    state["execution_path"] = list(state.get("execution_path", []))
+    state["seen_doc_ids"] = list(state.get("seen_doc_ids", []))
+    state["feature_tree_lite"] = state.get("feature_tree_lite", {"routing": {"prefer": "rerank"}})
+
+    # config 활용 예시(표준화): thread_id를 로그에 남김
+    tid = ((config or {}).get("configurable") or {}).get("thread_id") if config else None
+    if tid:
+        state["log"].append({"node": "compose_rpg", "thread_id": tid})
+
+    return state
+
+@trace_node("intent_parser")
+def intent_parser(state: State, config: Optional[RunnableConfig] = None) -> State:
+    """
+    - LLM으로 retrieval 친화적 질의 정제
+    - 템플릿 기반 System/Human 메시지 구성
+    """
+    templ = TemplateRegistry()
+    llm = get_llm(temperature=0.0)
+    sys = SystemMessage(content=get_prompt(templ, "system_base"))
+    hm = HumanMessage(content=f"{get_prompt(templ, 'ask_intent')}\n\nQuery:\n{state.get('query','')}")
+    out = llm.invoke([sys, hm])
+    refined = out.content.strip() if hasattr(out, "content") else state.get("query", "")
+    state["refined_query"] = refined
+    return state
+
+@trace_node("retrieve_rpg")
+def retrieve_rpg(state: State, config: Optional[RunnableConfig] = None) -> State:
+    """
+    - VectorStore에서 k개 검색 (전략/파라미터는 hints에서)
+    - 메타데이터/온톨로지 must_terms 필터를 적용
+    - 경량 메트릭 계산 및 저장
+    """
+    hints = state.get("retrieval_hints", {}) or {}
+    params = hints.get("params", {}) or {}
+    k = int(params.get("k", 8))
+    filters = hints.get("filters", {}) or {}
+    must_terms = hints.get("must_terms", []) or []
 
     vs = get_vectorstore()
-    pairs = _run_vs_search(vs, q, k=k, meta_filter=meta_filter)
-    pairs = _unique_by_source_scored(pairs, top_k=max(k, 12))
-    pairs = _boost_with_ns_terms(pairs, boost=0.03)
+    query = state.get("refined_query") or state.get("query") or ""
+    fetch_k = int(params.get("fetch_k", max(k * 3, k + 10)))  # FAISS 폴백 대비
+    pairs: List[Tuple[Document, float]] = vs.similarity_search_with_score(
+        query, k=k, filters=filters, must_terms=must_terms, fetch_k=fetch_k  # type: ignore
+    )
 
-    docs = [d for d, _ in pairs]
-    metrics = _metrics_from_pairs(pairs, k=k)
+    docs = [p[0] for p in pairs] if pairs else []
+    metrics = _compute_metrics(query, docs, must_terms, filters)
 
-    log = (state.get("log") or []) + [{"phase": "search", "dt": time.time() - t0, "note": f"k={k}, n={len(docs)}"}]
-    log = _trim_log(log)
+    state["retrieved_docs"] = docs
+    state["retrieval_metrics"] = metrics
+    return state
 
-    # initialize expands counter
-    hints.setdefault("expands", 0)
+@trace_node("award_xp")
+def award_xp(state: State, config: Optional[RunnableConfig] = None) -> State:
+    """
+    - 새 증거 공헌도: 이전에 보지 않은 문서 비율을 novel로 반영
+    - xp/xp_total 갱신
+    """
+    seen = set(state.get("seen_doc_ids", []))
+    docs = state.get("retrieved_docs", []) or []
+    new_ids = []
+    for d in docs:
+        did = _doc_id(d)
+        if did not in seen:
+            new_ids.append(did)
+            seen.add(did)
 
-    return {
-        "retrieved_docs": docs,
-        "retrieval_metrics": metrics,
-        "retrieval_hints": hints,
-        "phase": "search",
-        "execution_path": (state.get("execution_path") or []) + ["retrieve_rpg"],
-        "log": log,
-    }
+    novel_rate = (len(new_ids) / float(max(1, len(docs)))) if docs else 0.0
+    metrics = dict(state.get("retrieval_metrics", {}) or {})
+    metrics["novel_evidence_contrib"] = novel_rate
+    state["retrieval_metrics"] = metrics
 
-def award_xp(state: State) -> Dict[str, Any]:
-    t0 = time.time()
-    metrics = dict(state.get("retrieval_metrics") or {})
-    gain = int(10.0 * float(metrics.get("coverage") or 0.0) + 10.0 * float(metrics.get("diversity") or 0.0))
-    xp = int(state.get("xp") or 0) + gain
-    xp_total = float(state.get("xp_total") or 0.0) + float(gain)
+    inc = 1.0 if novel_rate >= 0.3 else 0.5 if novel_rate > 0 else 0.2
+    state["xp"] = int(state.get("xp", 0)) + 1
+    state["xp_total"] = float(state.get("xp_total", 0.0)) + inc
+    state["seen_doc_ids"] = list(seen)
+    return state
 
-    log = (state.get("log") or []) + [{"phase": "search", "dt": time.time() - t0, "note": f"xp+={gain}"}]
-    log = _trim_log(log)
+@trace_node("expand_search")
+def expand_search(state: State, config: Optional[RunnableConfig] = None) -> State:
+    """
+    - 힌트만 갱신(폭 확장): k 증가, diversity 옵션 부여 등
+    - 실제 재검색은 그래프 엣지 루프로 retrieve_rpg에서 수행
+    """
+    hints = dict(state.get("retrieval_hints", {}) or {})
+    params = dict(hints.get("params", {}) or {})
+    params["k"] = int(params.get("k", 8)) + 4  # 점진 확장
+    params["diversity_boost"] = True
+    params["fetch_k"] = max(int(params.get("fetch_k", 0)), params["k"] * 3)
+    hints["params"] = params
+    state["retrieval_hints"] = hints
 
-    return {
-        "xp": xp,
-        "xp_total": xp_total,
-        "phase": "search",
-        "execution_path": (state.get("execution_path") or []) + ["award_xp"],
-        "log": log,
-    }
+    # 확장 횟수 추적(로그)
+    meta = dict(state.get("rpg", {}) or {})
+    flows = list(meta.get("flows", []))
+    flows.append({"at": "expand_search", "k": params["k"]})
+    meta["flows"] = flows
+    state["rpg"] = meta
+    return state
 
-def expand_search(state: State) -> Dict[str, Any]:
-    t0 = time.time()
-    q = state.get("refined_query") or state.get("query") or ""
-    hints = dict(state.get("retrieval_hints") or {})
-    ctx = state.get("context_type") or "general"
-    meta_filter = _apply_meta_filter_by_context(ctx)
+@trace_node("rerank")
+def rerank(state: State, config: Optional[RunnableConfig] = None) -> State:
+    """
+    - 선택적 경량 CE 리랭크, 기본은 overlap 폴백
+    - 문서 순서를 정제하고 상위 k만 유지
+    """
+    hints = state.get("retrieval_hints", {}) or {}
+    docs = list(state.get("retrieved_docs", []) or [])
+    query = state.get("refined_query") or state.get("query") or ""
+    params = hints.get("params", {}) or {}
+    k = int(params.get("k", 8))
+    if not docs:
+        return state
 
-    expands = int(hints.get("expands") or 0) + 1
-    hints["expands"] = expands
-    base_k = int(hints.get("k") or 8)
-    new_k = min(base_k + 4 * expands, 32)
-    hints["k"] = new_k
+    rerank_params = hints.get("rerank_params", {}) or {}
+    rtype = rerank_params.get("type", "overlap")
+    ranked: List[Tuple[Document, float]]
 
-    must_terms = " ".join(hints.get("must_terms") or [])
-    aug_q = f"{q} {must_terms}".strip()
+    if rtype == "cross_encoder":
+        model_name = rerank_params.get("model") or os.getenv("RERANK_CE_MODEL", "").strip()
+        if model_name:
+            try:
+                from sentence_transformers import CrossEncoder  # type: ignore
+                bs = int(rerank_params.get("batch_size", int(os.getenv("RERANK_CE_BATCH_SIZE", "16"))))
+                topn = int(rerank_params.get("topn", int(os.getenv("RERANK_TOPN", str(k)))))
+                cand = docs[:max(k, min(len(docs), topn))]
+                pairs = [[query, d.page_content or ""] for d in cand]
+                ce = CrossEncoder(model_name)
+                scores = ce.predict(pairs, batch_size=bs)
+                ranked = sorted(list(zip(cand, [float(s) for s in scores])), key=lambda x: x[1], reverse=True)
+                state["retrieved_docs"] = [d for d, _ in ranked[:k]]
+                return state
+            except Exception:
+                # 폴백: overlap
+                pass
 
-    vs = get_vectorstore()
-    pairs = _run_vs_search(vs, aug_q, k=new_k, meta_filter=meta_filter)
-    pairs = _unique_by_source_scored(pairs, top_k=max(new_k, 12))
-    pairs = _boost_with_ns_terms(pairs, boost=0.03)
+    # 기본/폴백: overlap
+    ranked = sorted([(d, simple_overlap_score(query, d)) for d in docs], key=lambda x: x[1], reverse=True)
+    state["retrieved_docs"] = [d for d, _ in ranked[:k]]
+    return state
 
-    docs = [d for d, _ in pairs]
-    metrics = _metrics_from_pairs(pairs, k=new_k)
+@trace_node("plan_answer")
+def plan_answer(state: State, config: Optional[RunnableConfig] = None) -> State:
+    """
+    - LLM으로 다중 클레임 계획 간단 생성
+    - 증거 인덱스는 상위 3개 문서를 매핑(간이)
+    """
+    templ = TemplateRegistry()
+    llm = get_llm(temperature=0.0)
+    sys = SystemMessage(content=get_prompt(templ, "system_base"))
+    joined = "\n\n".join([f"[{i}] {d.page_content[:400]}" for i, d in enumerate(state.get("retrieved_docs", [])[:3])])
+    hm = HumanMessage(content=f"{get_prompt(templ, 'plan_answer')}\n\nQuery:\n{state.get('refined_query') or state.get('query','')}\n\nEvidence:\n{joined}")
+    out = llm.invoke([sys, hm])
+    plan_text = out.content.strip() if hasattr(out, "content") else ""
+    claims = [ln.strip("- ").strip() for ln in plan_text.splitlines() if ln.strip()]
+    plan = [{"claim": c, "evidence": [0, 1, 2]} for c in claims[:3]] or [{"claim": "Direct answer", "evidence": [0, 1]}]
+    state["answer_plan"] = plan
+    return state
 
-    log = (state.get("log") or []) + [{"phase": "expand", "dt": time.time() - t0, "note": f"k={new_k}, n={len(docs)}"}]
-    log = _trim_log(log)
-
-    return {
-        "retrieval_hints": hints,
-        "retrieved_docs": docs,
-        "retrieval_metrics": metrics,
-        "phase": "expand",
-        "execution_path": (state.get("execution_path") or []) + ["expand_search"],
-        "log": log,
-    }
-
-def rerank(state: State) -> Dict[str, Any]:
-    t0 = time.time()
-    q = state.get("refined_query") or state.get("query") or ""
-    hints = dict(state.get("retrieval_hints") or {})
-    strategy = hints.get("reranker") or "none"
-
-    # fabricate pairs with pseudo-scores for stable ordering
-    docs = list(state.get("retrieved_docs") or [])
-    pairs = [(d, float(len(d.page_content or ""))) for d in docs]  # content length as weak proxy
-    pairs = _apply_rerank(pairs, q, strategy=strategy)
-
-    # keep top-N
-    top_k = min(12, len(pairs))
-    pairs = pairs[:top_k]
-    docs_out = [d for d, _ in pairs]
-
-    # loopback decision: if empty and can expand more
-    expands = int(hints.get("expands") or 0)
-    if not docs_out and expands < _MAX_EXPANDS:
-        phase = "expand"
-        note = "need_more_evidence"
-    else:
-        phase = "rerank"
-        note = f"top={len(docs_out)}"
-
-    log = (state.get("log") or []) + [{"phase": "rerank", "dt": time.time() - t0, "note": note}]
-    log = _trim_log(log)
-
-    return {
-        "retrieved_docs": docs_out,
-        "phase": phase,  # graph checks for "expand" to loop; otherwise continues
-        "execution_path": (state.get("execution_path") or []) + ["rerank"],
-        "log": log,
-    }
-
-def plan_answer(state: State) -> Dict[str, Any]:
-    t0 = time.time()
-    docs: List[Document] = list(state.get("retrieved_docs") or [])
-    # 간단 계획: 상위 문서에서 스니펫 추출
-    top_n = min(5, len(docs))
-    plan: List[Dict[str, Any]] = []
-    sources: List[str] = []
-    for idx in range(top_n):
-        d = docs[idx]
-        src = (d.metadata or {}).get("source") or (d.metadata or {}).get("id") or f"doc_{idx+1}"
-        if src not in sources:
-            sources.append(src)
-        content = (d.page_content or "").strip().splitlines()
-        snippet = "\n".join(content[:3])[:600]
-        plan.append({"claim": f"evidence_{idx+1}", "snippet": snippet, "source": src})
-
-    citation_policy = {
-        "enable": True,
-        "max": 5,
-        "inline": False,
-        "append_section": True,
-        "label": "출처",
-    }
-
-    log = (state.get("log") or []) + [{"phase": "plan", "dt": time.time() - t0, "note": f"plan k={len(plan)}"}]
-    log = _trim_log(log)
-
-    return {
-        "answer_plan": plan,
-        "sources": sources,
-        "citation_policy": citation_policy,
-        "phase": "plan",
-        "execution_path": (state.get("execution_path") or []) + ["plan_answer"],
-        "log": log,
-    }
-
-def generate_answer(state: State) -> Dict[str, Any]:
-    t0 = time.time()
-    q = state.get("refined_query") or state.get("query") or ""
-    plan: List[Dict[str, Any]] = state.get("answer_plan") or []
-    sources: List[str] = state.get("sources") or []
-    policy = state.get("citation_policy") or {"enable": True, "append_section": True, "label": "출처"}
-
-    # 프롬프트 최소 구성
-    evidence_lines = []
-    for i, p in enumerate(plan, start=1):
-        snippet = p.get("snippet", "")
-        src = p.get("source", f"doc_{i}")
-        evidence_lines.append(f"[{i}] ({src})\n{snippet}")
-
-    sys = SystemMessage(content="답변은 한국어로 간결하고 정확하게 작성하라. 모를 경우 추측하지 말라.")
-    hm = HumanMessage(content=f"질문:\n{q}\n\n증거:\n" + "\n\n".join(evidence_lines))
+@trace_node("generate_answer")
+def generate_answer(state: State, config: Optional[RunnableConfig] = None) -> State:
+    """
+    - LLM으로 최종 생성
+    - citation_policy에 따라 출처 라벨 포함
+    """
+    templ = TemplateRegistry()
     llm = get_llm(temperature=0.2)
+    sys = SystemMessage(content=get_prompt(templ, "system_base"))
+    ev = state.get("retrieved_docs", []) or []
+    joined = "\n\n".join([f"[{i}] {d.page_content[:600]}" for i, d in enumerate(ev[:5])])
+    hm = HumanMessage(content=f"{get_prompt(templ, 'generate_answer')}\n\nPlan:\n{state.get('answer_plan')}\n\nEvidence:\n{joined}\n\nQuery:\n{state.get('refined_query') or state.get('query','')}")
+    out = llm.invoke([sys, hm])
+    answer = out.content.strip() if hasattr(out, "content") else ""
+    state["answer"] = answer
 
-    try:
-        answer_core = llm.invoke([sys, hm]).content.strip()
-    except Exception:
-        answer_core = "증거가 충분하지 않아 확답을 제공하기 어렵다."
+    # 출처 수집(중복 제거)
+    srcs: List[str] = []
+    for d in ev[:5]:
+        src = str((d.metadata or {}).get("source", "")) or "doc"
+        if src not in srcs:
+            srcs.append(src)
+    state["sources"] = srcs
+    return state
 
-    # 간단한 출처 섹션
-    if policy.get("enable") and policy.get("append_section"):
-        label = policy.get("label", "출처")
-        uniq_sources = []
-        for s in sources:
-            if s and s not in uniq_sources:
-                uniq_sources.append(s)
-        if uniq_sources:
-            answer_core = f"{answer_core}\n\n{label}:\n" + "\n".join(f"- {s}" for s in uniq_sources)
-
-    log = (state.get("log") or []) + [{"phase": "answer", "dt": time.time() - t0, "note": "generated"}]
-    log = _trim_log(log)
-
-    return {
-        "answer": answer_core,
-        "final_answer": answer_core,
-        "answer_type": "rag_answer",
-        "phase": "end",
-        "execution_path": (state.get("execution_path") or []) + ["generate_answer"],
-        "log": log,
-    }
+# 참고: 특정 노드에서 “업데이트 + 라우팅”을 동시 처리해야 할 케이스는
+# Command 반환 패턴으로 대체 가능(예: return Command(goto="rerank")),
+# 본 설계는 정책 외부화 + 조건부 엣지로 라우팅을 유지(그래프에서 관리).
