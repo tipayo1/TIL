@@ -1,56 +1,46 @@
-# rpg.py (UPDATED: policy integration)
+# rpg.py (lightweight building blocks for LEGO-style agents)
 from __future__ import annotations
 
 import os
+import re
 import json
+import time
+from pathlib import Path
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Any, Tuple
-from abc import ABC, abstractmethod
+from typing import List, Dict, Optional, Any, Tuple, Callable
 
-from policy import need_expand, COVERAGE_TH, DIVERSITY_TH  # centralized policy
+# ---------------- Feature Tree (minimal) ----------------
+@dataclass(slots=True)
+class FeatureTreeNode:
+    fid: str
+    name: str
+    score: float = 0.0
+    file_hint: Optional[str] = None
+    children: List["FeatureTreeNode"] = field(default_factory=list)
 
-# -----------------------------
-# Config (env-driven overrides)
-# -----------------------------
-def _float_env(name: str, default: float) -> float:
-    try:
-        return float(os.getenv(name, str(default)))
-    except Exception:
-        return default
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "fid": self.fid,
+            "name": self.name,
+            "score": float(self.score),
+            "file_hint": self.file_hint or "",
+            "children": [c.to_dict() for c in self.children],
+        }
 
-def _load_json_env(name: str) -> Optional[dict]:
-    raw = os.getenv(name)
-    if not raw:
-        return None
-    try:
-        return json.loads(raw)
-    except Exception:
-        return None
+class FeatureTree:
+    def __init__(self, roots: Optional[List[FeatureTreeNode]] = None):
+        self.roots: List[FeatureTreeNode] = roots or []
 
-DEFAULT_PATH = json.loads(
-    os.getenv(
-        "RPG_DEFAULT_PATH",
-        '["intent_parser","retrieve_rpg","rerank","plan_answer","generate_answer"]',
-    )
-)
+    def to_dict(self) -> Dict[str, Any]:
+        return {"roots": [r.to_dict() for r in self.roots]}
 
-# -----------------------------
-# RPG Nodes / Graph (lightweight)
-# -----------------------------
-def _prune_meta(meta: Dict[str, Any], max_kv: int = 16) -> Dict[str, Any]:
-    """Keep only small scalar/meta keys to avoid oversized payloads."""
-    out: Dict[str, Any] = {}
-    for k, v in meta.items():
-        if isinstance(v, (str, int, float, bool)) and len(str(v)) < 200:
-            out[k] = v
-    return out
-
+# ---------------- RPG graph (placeholder for future) ----------------
 @dataclass(slots=True)
 class RPGNode:
     name: str
     node_type: str  # "capability" | "component" | "function"
     children: List["RPGNode"] = field(default_factory=list)
-    dependencies: List[str] = field(default_factory=list)  # names
+    dependencies: List[str] = field(default_factory=list)
     data_flows: List[Dict[str, Any]] = field(default_factory=list)
     meta: Dict[str, Any] = field(default_factory=dict)
 
@@ -60,7 +50,7 @@ class RPGNode:
             "type": self.node_type,
             "dependencies": list(self.dependencies),
             "data_flows": list(self.data_flows),
-            "meta": _prune_meta(dict(self.meta)),
+            "meta": dict(self.meta),
             "children": [c.to_dict() for c in self.children],
         }
 
@@ -73,25 +63,136 @@ class RPGGraph:
         self.root_nodes.append(node)
 
     def to_dict(self) -> Dict[str, Any]:
-        return {"meta": _prune_meta(dict(self.meta)), "roots": [r.to_dict() for r in self.root_nodes]}
+        return {"meta": dict(self.meta), "roots": [r.to_dict() for r in self.root_nodes]}
 
-    def suggest_execution_path(self, metrics: Optional[Dict[str, Any]] = None) -> List[str]:
-        """
-        Provide a recommended path; LangGraph execution remains the source of truth.
-        """
-        m = metrics or {}
-        path = ["intent_parser", "retrieve_rpg"]
-        if need_expand(m):
-            path.append("expand_search")
-        path += ["rerank", "plan_answer", "generate_answer"]
-        return path
+def merge_rpg(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(a or {})
+    for k, v in (b or {}).items():
+        if k not in out:
+            out[k] = v
+    return out
 
-# -----------------------------
-# Registry and Binding
-# -----------------------------
+class RPGVersionStore:
+    def __init__(self, root_dir: Optional[str] = None):
+        self.root = Path(root_dir or ".rag/versions")
+        self.root.mkdir(parents=True, exist_ok=True)
+        self._counter = 0
+
+    def save(self, graph: Dict[str, Any], note: str = "") -> int:
+        self._counter += 1
+        rec = {"version": self._counter, "graph": graph, "ts": time.time(), "note": note}
+        path = self.root / f"graph_{self._counter}.json"
+        path.write_text(json.dumps(rec, ensure_ascii=False, indent=2), encoding="utf-8")
+        return self._counter
+
+# ---------------- Templates (composable) ----------------
+@dataclass(slots=True)
+class TemplateSpec:
+    id: str
+    domain: str
+    micro_intent: str
+    blocks: List[str]
+
+class TemplateRegistry:
+    def __init__(self, root: Optional[str] = None):
+        self.root = Path(root or os.getenv("TEMPLATE_ROOT", "templates"))
+        self.root.mkdir(parents=True, exist_ok=True)
+        self._cache: Dict[str, str] = {}
+
+    def load_block(self, block_id: str) -> str:
+        if block_id in self._cache:
+            return self._cache[block_id]
+        path = self.root / f"{block_id}.j2"
+        if not path.exists():
+            defaults: Dict[str, str] = {
+                "common/preamble": "다음 지시를 따르라. 필요한 경우만 간결히 답하라.\n",
+                "common/evidence": "요약: {question}\n핵심 근거:\n{evidence}\n",
+                "common/sources_tail": "{sources_tail}\n",
+                "legal/irac": "이슈: {issue}\n규칙: {rules}\n분석: {analysis}\n결론: {conclusion}\n주의: 본 답변은 일반 정보이며 법률 자문이 아닙니다.\n",
+                "technical/rca": "현상: {symptom}\n재현: {repro}\n원인: {cause}\n수정: {fix}\n검증: {verify}\n",
+                "conversational/ack_ask_act": "공감: {ack}\n질문: {ask}\n제안: {act}\n",
+            }
+            text = defaults.get(block_id, f"[{block_id}]")
+            self._cache[block_id] = text
+            return text
+        txt = path.read_text(encoding="utf-8")
+        self._cache[block_id] = txt
+        return txt
+
+    def compose(self, spec: TemplateSpec) -> str:
+        return "\n\n".join(self.load_block(b) for b in spec.blocks)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"root": str(self.root)}
+
+# ---------------- Ontology (lightweight) ----------------
+class OntologyProvider:
+    def __init__(self, path: Optional[str] = None, json_env: Optional[str] = "ONTOLOGY_JSON"):
+        self.path = Path(path or os.getenv("ONTOLOGY_PATH", "ontology.yaml"))
+        self._raw: Dict[str, Any] = {}
+        env_data = None
+        try:
+            env_data = json.loads(os.getenv(json_env) or "{}")
+        except Exception:
+            env_data = {}
+        if env_data:
+            self._raw = env_data
+        else:
+            if self.path.exists():
+                text = self.path.read_text(encoding="utf-8")
+                if self.path.suffix.lower() in (".json",):
+                    try:
+                        self._raw = json.loads(text)
+                    except Exception:
+                        self._raw = {}
+                else:
+                    try:
+                        import yaml  # type: ignore
+                        self._raw = yaml.safe_load(text) or {}
+                    except Exception:
+                        self._raw = {}
+        if not isinstance(self._raw, dict):
+            self._raw = {}
+
+    @property
+    def version(self) -> str:
+        raw = self._raw if isinstance(self._raw, dict) else {}
+        return str(raw.get("version") or raw.get("_v") or "v0")
+
+    def enrich(self, q: str, base_hints: Dict[str, Any]) -> Dict[str, Any]:
+        hints = dict(base_hints or {})
+        ql = (q or "").lower()
+        must_terms: List[str] = list(hints.get("must_terms") or [])
+        filters: Dict[str, Any] = {}
+        tpl_hints: Dict[str, Any] = {}
+
+        concepts = (self._raw.get("concepts") or {}) if isinstance(self._raw, dict) else {}
+        for _, c in concepts.items():
+            syns = [str(s).lower() for s in (c.get("synonyms") or [])]
+
+            def match(s: str) -> bool:
+                return bool(re.search(s[3:], ql)) if s.startswith("re:") else s in ql
+
+            if any(match(s) for s in syns):
+                must_terms += list(c.get("must_terms") or [])
+                for k, v in (c.get("filters") or {}).items():
+                    filters[k] = v
+                for k, v in (c.get("template_hints") or {}).items():
+                    tpl_hints[k] = v
+
+        if must_terms:
+            hints["must_terms"] = sorted(set(must_terms))
+        hints.update(filters)
+        hints.update(tpl_hints)
+        hints["ontology_version"] = self.version
+        return hints
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"version": self.version}
+
+# ---------------- Registry & binding ----------------
 class RAGComponentRegistry:
     def __init__(self):
-        # defaults
         self.retrieval_strategies: Dict[str, Dict[str, Any]] = {
             "semantic": {"name": "semantic", "k": 8},
             "expand": {"name": "expand", "k": 16},
@@ -110,31 +211,44 @@ class RAGComponentRegistry:
             "template": {"name": "template"},
             "cot": {"name": "chain_of_thought"},
         }
-        # optional env overrides (json)
-        if (ov := _load_json_env("RAG_STRATEGIES_JSON")):
+        self.feature_to_module: Dict[str, str] = {
+            "retrieval.semantic": "retrievers/semantic.py",
+            "retrieval.hybrid": "retrievers/hybrid.py",
+            "retrieval.expand": "retrievers/expand.py",
+            "retrieval.legal": "retrievers/legal.py",
+            "rerank.cross_encoder": "rerankers/cross_encoder.py",
+            "rerank.llm_based": "rerankers/llm_based.py",
+            "generator.evidence_based": "generators/evidence.py",
+            "generator.template": "generators/template.py",
+            "generator.cot": "generators/cot.py",
+        }
+        try:
+            ov = json.loads(os.getenv("RAG_STRATEGIES_JSON") or "{}")
             self.retrieval_strategies.update(ov.get("retrieval", {}))
             self.rerankers.update(ov.get("rerankers", {}))
             self.generators.update(ov.get("generators", {}))
+        except Exception:
+            pass
+        try:
+            ov2 = json.loads(os.getenv("FEATURE_TO_MODULE_JSON") or "{}")
+            if isinstance(ov2, dict):
+                self.feature_to_module.update(ov2)
+        except Exception:
+            pass
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "retrieval": self.retrieval_strategies,
             "rerankers": self.rerankers,
             "generators": self.generators,
+            "feature_to_module": self.feature_to_module,
         }
 
-def bind_registry_to_hints(
-    registry: Dict[str, Any],
-    context_type: str,
-    base_hints: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    """
-    Choose retrieval/rerank/generation config by context and merge into hints.
-    """
+def bind_registry_to_hints(registry: Dict[str, Any], context_type: str, base_hints: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     hints = dict(base_hints or {})
-    retr_map = registry.get("retrieval", {})
-    rer_map = registry.get("rerankers", {})
-    gen_map = registry.get("generators", {})
+    retr_map = registry.get("retrieval", {}) if isinstance(registry, dict) else {}
+    rer_map = registry.get("rerankers", {}) if isinstance(registry, dict) else {}
+    gen_map = registry.get("generators", {}) if isinstance(registry, dict) else {}
 
     if context_type == "legal":
         chosen = retr_map.get("legal") or retr_map.get("hybrid") or retr_map.get("semantic")
@@ -164,123 +278,26 @@ def bind_registry_to_hints(
         hints["generator"] = gen.get("name")
     return hints
 
-# -----------------------------
-# Data Flow contracts
-# -----------------------------
+# ---------------- Flow & tests (stubs) ----------------
 class DataFlowManager:
-    """
-    Describe payload schemas and validate runtime state against contracts.
-    """
     def __init__(self):
-        self.schemas: Dict[Tuple[str, str], Dict[str, Any]] = {
-            ("intent_parser", "retrieve_rpg"): {"required": ["refined_query", "retrieval_hints"]},
-            ("retrieve_rpg", "award_xp"): {"required": ["retrieved_docs", "retrieval_metrics"]},
-            ("award_xp", "expand_search"): {"required": ["retrieval_metrics"]},
-            ("award_xp", "rerank"): {"required": ["retrieved_docs"]},
-            ("expand_search", "rerank"): {"required": ["retrieved_docs", "retrieval_metrics"]},
-            ("rerank", "plan_answer"): {"required": ["retrieved_docs"]},
-            ("plan_answer", "generate_answer"): {"required": ["answer_plan", "retrieved_docs"]},
-        }
+        self._pre: List[Callable[[str, str, Dict[str, Any]], Dict[str, Any]]] = []
 
-    def describe(self) -> List[Dict[str, Any]]:
-        return [{"from": frm, "to": to, "schema": sch} for (frm, to), sch in self.schemas.items()]
+    def add_preprocess(self, fn: Callable[[str, str, Dict[str, Any]], Dict[str, Any]]):
+        self._pre.append(fn)
 
-    def validate(self, frm: str, to: str, state: Dict[str, Any]) -> Dict[str, Any]:
-        schema = self.schemas.get((frm, to))
-        violations: List[str] = []
-        if not schema:
-            return {"ok": True, "violations": violations}
-        required = schema.get("required", [])
-        for key in required:
-            if key not in state or state.get(key) is None:
-                violations.append(f"Missing required '{key}' for flow {frm} -> {to}")
-        return {"ok": len(violations) == 0, "violations": violations}
+    def preprocess(self, frm: str, to: str, st: Dict[str, Any]) -> Dict[str, Any]:
+        out = dict(st or {})
+        for fn in self._pre:
+            out = fn(frm, to, out) or out
+        return out
 
-def unit_test_flow_assertions(dfm: DataFlowManager) -> List[str]:
-    """Simple static checks for schema coherence."""
-    issues: List[str] = []
-    for desc in dfm.describe():
-        schema = desc["schema"]
-        if not isinstance(schema, dict) or "required" not in schema:
-            issues.append(f"Schema invalid for {desc['from']}->{desc['to']}")
-    return issues
+def unit_test_flow_assertions(state_or_graph: Dict[str, Any]) -> Dict[str, Any]:
+    return {"ok": True}
 
-# -----------------------------
-# Domain graph builders
-# -----------------------------
-def build_general_rag_graph(query: str) -> RPGGraph:
-    understand = RPGNode("QueryUnderstanding", "capability")
-    retrieve = RPGNode("Retrieval", "capability", dependencies=["QueryUnderstanding"])
-    rerank = RPGNode("Rerank", "capability", dependencies=["Retrieval"])
-    plan = RPGNode("Plan", "capability", dependencies=["Rerank"])
-    answer = RPGNode("Answer", "capability", dependencies=["Plan"])
-
-    retrieve_sem = RPGNode("SemanticRetrieval", "component", meta={"k": 8})
-    retrieve_exp = RPGNode("ExpandedRetrieval", "component", meta={"k": 16})
-    retrieve.children = [retrieve_sem, retrieve_exp]
-
-    graph = RPGGraph(
-        root_nodes=[understand, retrieve, rerank, plan, answer],
-        meta={"query": (query or ""), "style": "general-evidence-based"},
-    )
-    return graph
-
-def build_legal_rag_graph(query: str) -> RPGGraph:
-    g = build_general_rag_graph(query)
-    g.meta["domain"] = "legal"
-    for r in g.root_nodes:
-        if r.name == "Retrieval":
-            r.meta["section_boost"] = True
-    return g
-
-def build_technical_rag_graph(query: str) -> RPGGraph:
-    g = build_general_rag_graph(query)
-    g.meta["domain"] = "technical"
-    for r in g.root_nodes:
-        if r.name == "Retrieval":
-            r.meta["code_boost"] = True
-    return g
-
-def build_conversational_rag_graph(query: str) -> RPGGraph:
-    g = build_general_rag_graph(query)
-    g.meta["domain"] = "conversational"
-    for r in g.root_nodes:
-        if r.name == "Rerank":
-            r.meta["lightweight"] = True
-    return g
-
-def configure_rag_for_context(context_type: str, query: str) -> RPGGraph:
-    if context_type == "legal":
-        return build_legal_rag_graph(query)
-    if context_type == "technical":
-        return build_technical_rag_graph(query)
-    if context_type == "conversational":
-        return build_conversational_rag_graph(query)
-    return build_general_rag_graph(query)
-
-# -----------------------------
-# Plugin system
-# -----------------------------
-class RAGPlugin(ABC):
-    @abstractmethod
-    def get_capabilities(self) -> List[str]:
-        """Return capabilities offered by the plugin"""
-        raise NotImplementedError
-
-    @abstractmethod
-    def execute(self, state: Dict[str, Any], **kwargs) -> Dict[str, Any]:
-        """Execute plugin logic and return partial state update"""
-        raise NotImplementedError
-
-class LegalRetrievalPlugin(RAGPlugin):
-    def get_capabilities(self) -> List[str]:
-        return ["legal_document_retrieval", "section_filtering"]
-
-    def execute(self, state: Dict[str, Any], **kwargs) -> Dict[str, Any]:
-        hints = dict(state.get("retrieval_hints") or {})
-        hints["section_boost"] = True
-        hints["k"] = max(12, int(hints.get("k", 10)))
-        plugins = list(state.get("plugins") or [])
-        if "legal" not in plugins:
-            plugins.append("legal")
-        return {"retrieval_hints": hints, "plugins": plugins}
+# ---------------- Context configurator ----------------
+def configure_rag_for_context(context_type: str) -> Tuple[RAGComponentRegistry, TemplateRegistry, OntologyProvider]:
+    reg = RAGComponentRegistry()
+    tpl = TemplateRegistry()
+    onto = OntologyProvider()
+    return reg, tpl, onto

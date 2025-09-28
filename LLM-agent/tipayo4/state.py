@@ -1,4 +1,5 @@
-# state.py (UPDATED)
+# state.py (RPG: versioning & validation & feature tree + template/ontology hints)
+
 from typing import Literal, Optional, Dict, List, Any
 from langgraph.graph import MessagesState
 from langchain_core.documents import Document
@@ -12,24 +13,55 @@ class State(MessagesState, total=False):
 
     # 검색 힌트/결과
     retrieval_hints: Dict[str, Optional[Any]]
+
+    # 템플릿/온톨로지 힌트 및 버전
+    template_hints: Dict[str, Any]
+    ontology_version: str
+
+    # 노드들이 실제로 사용하는 필드 명시 (정합성)
     retrieved_docs: List[Document]
-    retrieval_metrics: Dict[str, Any]  # {k, n, avg_score, coverage, diversity, ...}
+    retrieval_metrics: Dict[str, Any]  # {k, n, avg_score, coverage, diversity, intent_coverage, negative_rate, novel_evidence_contrib}
 
     # 증거 계획 및 최종 답변
     answer_plan: List[Dict[str, Any]]  # [{"claim": str, "evidence": [int]}]
     answer: str
 
-    # RPG형 진행상태/경험치/로그
+    # 인용/출처 표기
+    sources: List[str]  # 최종 답변에 사용/표시한 고유 출처 목록
+    citation_policy: Dict[str, Any]  # {"enable": bool, "max": int, "inline": bool, "append_section": bool, "label": str}
+
+    # 진행상태/경험치/로그
     phase: Literal["setup", "refine", "search", "expand", "rerank", "plan", "answer", "end"]
     xp: int
+    xp_total: float  # 누적 학습량/적응 업데이트를 위한 실수 누계
     fail_count: int
     log: List[Dict[str, Any]]
 
-    # NEW: RPG/Composability
+    # RPG core
     rpg: Dict[str, Any]  # {"graph": {...}, "registry": {...}, "flows": [...]}
-    execution_path: List[str]  # ["intent_parser", "retrieve_rpg", ...]
-    plugins: List[str]  # 활성화된 플러그인 식별자
+    execution_path: List[str]  # ["compose_rpg","intent_parser","retrieve_rpg",...]
+    plugins: List[str]
 
-    # NEW: Context & validation
+    # Context & validation
     context_type: Literal["general", "legal", "technical", "conversational"]
     flow_violations: List[Dict[str, Any]]
+
+    # RPG persistence/versioning
+    rpg_versions: List[Dict[str, Any]]  # [{ "version": int, "graph": {...}, "ts": float, "note": str }]
+    rpg_version: int  # current version counter
+
+    # Feature tree / selection
+    feature_tree: Dict[str, Any]  # {"roots":[...]} serialized FeatureTree
+    subtree_choice: Dict[str, Any]  # {"retrieval": "semantic|hybrid|expand", ...}
+
+    # Router fields (kept for compatibility)
+    route: Literal["rag", "department", "reject"]
+    department_info: Dict[str, str]
+    final_answer: str
+    answer_type: Literal["rag_answer", "department_contact", "reject"]
+
+    # Testing / CI-lite
+    test_results: Dict[str, Any]
+
+    # Threading / persistence key
+    thread_id: str

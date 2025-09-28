@@ -1,0 +1,39 @@
+{
+  "version": 1,
+  "graph": {
+    "meta": {
+      "context": "general",
+      "question_len": 21
+    },
+    "roots": [
+      {
+        "name": "retrieval",
+        "type": "capability",
+        "dependencies": [],
+        "data_flows": [],
+        "meta": {
+          "context": "general"
+        },
+        "children": []
+      },
+      {
+        "name": "rerank",
+        "type": "capability",
+        "dependencies": [],
+        "data_flows": [],
+        "meta": {},
+        "children": []
+      },
+      {
+        "name": "generate",
+        "type": "capability",
+        "dependencies": [],
+        "data_flows": [],
+        "meta": {},
+        "children": []
+      }
+    ]
+  },
+  "ts": 1758930892.871338,
+  "note": "context=general"
+}
