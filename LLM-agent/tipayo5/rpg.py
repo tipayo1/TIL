@@ -1,4 +1,5 @@
 # rpg.py (lightweight building blocks for LEGO-style agents)
+
 from __future__ import annotations
 
 import os
@@ -10,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Any, Tuple, Callable
 
 # ---------------- Feature Tree (minimal) ----------------
+
 @dataclass(slots=True)
 class FeatureTreeNode:
     fid: str
@@ -27,6 +29,7 @@ class FeatureTreeNode:
             "children": [c.to_dict() for c in self.children],
         }
 
+
 class FeatureTree:
     def __init__(self, roots: Optional[List[FeatureTreeNode]] = None):
         self.roots: List[FeatureTreeNode] = roots or []
@@ -35,6 +38,7 @@ class FeatureTree:
         return {"roots": [r.to_dict() for r in self.roots]}
 
 # ---------------- RPG graph (placeholder for future) ----------------
+
 @dataclass(slots=True)
 class RPGNode:
     name: str
@@ -54,6 +58,7 @@ class RPGNode:
             "children": [c.to_dict() for c in self.children],
         }
 
+
 @dataclass(slots=True)
 class RPGGraph:
     root_nodes: List[RPGNode] = field(default_factory=list)
@@ -65,12 +70,14 @@ class RPGGraph:
     def to_dict(self) -> Dict[str, Any]:
         return {"meta": dict(self.meta), "roots": [r.to_dict() for r in self.root_nodes]}
 
+
 def merge_rpg(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
     out = dict(a or {})
     for k, v in (b or {}).items():
         if k not in out:
             out[k] = v
     return out
+
 
 class RPGVersionStore:
     def __init__(self, root_dir: Optional[str] = None):
@@ -86,6 +93,7 @@ class RPGVersionStore:
         return self._counter
 
 # ---------------- Templates (composable) ----------------
+
 @dataclass(slots=True)
 class TemplateSpec:
     id: str
@@ -126,6 +134,7 @@ class TemplateRegistry:
         return {"root": str(self.root)}
 
 # ---------------- Ontology (lightweight) ----------------
+
 class OntologyProvider:
     def __init__(self, path: Optional[str] = None, json_env: Optional[str] = "ONTOLOGY_JSON"):
         self.path = Path(path or os.getenv("ONTOLOGY_PATH", "ontology.yaml"))
@@ -191,6 +200,7 @@ class OntologyProvider:
         return {"version": self.version}
 
 # ---------------- Registry & binding ----------------
+
 class RAGComponentRegistry:
     def __init__(self):
         self.retrieval_strategies: Dict[str, Dict[str, Any]] = {
@@ -244,6 +254,7 @@ class RAGComponentRegistry:
             "feature_to_module": self.feature_to_module,
         }
 
+
 def bind_registry_to_hints(registry: Dict[str, Any], context_type: str, base_hints: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     hints = dict(base_hints or {})
     retr_map = registry.get("retrieval", {}) if isinstance(registry, dict) else {}
@@ -279,6 +290,7 @@ def bind_registry_to_hints(registry: Dict[str, Any], context_type: str, base_hin
     return hints
 
 # ---------------- Flow & tests (stubs) ----------------
+
 class DataFlowManager:
     def __init__(self):
         self._pre: List[Callable[[str, str, Dict[str, Any]], Dict[str, Any]]] = []
@@ -292,12 +304,82 @@ class DataFlowManager:
             out = fn(frm, to, out) or out
         return out
 
+
 def unit_test_flow_assertions(state_or_graph: Dict[str, Any]) -> Dict[str, Any]:
     return {"ok": True}
 
 # ---------------- Context configurator ----------------
+
 def configure_rag_for_context(context_type: str) -> Tuple[RAGComponentRegistry, TemplateRegistry, OntologyProvider]:
     reg = RAGComponentRegistry()
     tpl = TemplateRegistry()
     onto = OntologyProvider()
     return reg, tpl, onto
+
+# ---------------- Prompt registry (absorbed from plan_A) ----------------
+
+PROMPT_REGISTRY: Dict[str, Dict[str, str]] = {
+    "qa_grounded": {
+        "system": "다음 컨텍스트에 근거해 간결하고 출처를 유지하며 답하세요. 알 수 없으면 모른다고 답하세요.",
+        "user": "질문: {query}\n컨텍스트:\n{context}\n",
+    },
+    "summarize": {
+        "system": "컨텍스트를 정확히 요약하고 항목별로 구조화하세요.",
+        "user": "요약 대상 컨텍스트:\n{context}\n",
+    },
+}
+
+def get_prompt(template_key: str, variables: Dict[str, Any]) -> Dict[str, str]:
+    tpl = PROMPT_REGISTRY.get(template_key) or PROMPT_REGISTRY["qa_grounded"]
+    return {
+        "system": tpl["system"].format(**variables),
+        "user": tpl["user"].format(**variables),
+    }
+
+# ---------------- Tool registry (absorbed from plan_A) ----------------
+
+class ToolContext:
+    def __init__(self, corpus_meta: Dict[str, Any]):
+        self.corpus_meta = corpus_meta
+
+def tool_citation_check(args: Dict[str, Any], ctx: ToolContext) -> Dict[str, Any]:
+    # Placeholder: naive bracket check + sources count
+    answer = args.get("answer", "") or ""
+    has_bracket = ("[" in answer and "]" in answer)
+    has_sources = "출처:" in answer or "Sources:" in answer
+    return {"ok": bool(has_bracket or has_sources), "note": "citation present" if (has_bracket or has_sources) else "missing citation"}
+
+def tool_section_outline(args: Dict[str, Any], ctx: ToolContext) -> Dict[str, Any]:
+    docs: List[Dict[str, Any]] = args.get("docs", [])
+    outline = [d.get("section", f"sec-{i}") for i, d in enumerate(docs)]
+    return {"outline": outline}
+
+def tool_table_reader(args: Dict[str, Any], ctx: ToolContext) -> Dict[str, Any]:
+    return {"rows": args.get("rows", []), "columns": args.get("columns", [])}
+
+def tool_quote_extractor(args: Dict[str, Any], ctx: ToolContext) -> Dict[str, Any]:
+    docs: List[Dict[str, Any]] = args.get("docs", [])
+    quotes = [d.get("text", "")[:200] for d in docs[:3]]
+    return {"quotes": quotes}
+
+TOOL_REGISTRY: Dict[str, Callable[[Dict[str, Any], ToolContext], Dict[str, Any]]] = {
+    "citation_check": tool_citation_check,
+    "section_outline": tool_section_outline,
+    "table_reader": tool_table_reader,
+    "quote_extractor": tool_quote_extractor,
+}
+
+def call_tool(name: str, args: Dict[str, Any], corpus_meta: Dict[str, Any]) -> Dict[str, Any]:
+    fn = TOOL_REGISTRY.get(name)
+    if not fn:
+        return {"error": f"unknown_tool:{name}"}
+    return fn(args, ToolContext(corpus_meta))
+
+def suggest_tools_for_context(context_type: str) -> List[str]:
+    if context_type == "legal":
+        return ["citation_check", "quote_extractor"]
+    if context_type == "technical":
+        return ["citation_check"]
+    if context_type == "conversational":
+        return []
+    return ["citation_check"]

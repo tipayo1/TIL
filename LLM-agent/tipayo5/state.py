@@ -51,8 +51,10 @@ class State(MessagesState, total=False):
     rpg_version: int  # current version counter
 
     # Feature tree / selection
-    feature_tree: Dict[str, Any]  # {"roots":[...]} serialized FeatureTree
-    subtree_choice: Dict[str, Any]  # {"retrieval": "semantic|hybrid|expand", ...}
+    # feature_tree.lite: Dict[feature_key, {"retrieval","k","max_expands","reranker","generator","template_blocks","metrics_ma":{...}}]
+    feature_tree: Dict[str, Any]  # {"lite": {...}} 등 직렬화 가능 구조
+    feature_key: str  # 현재 쿼리의 FT-Lite 키
+    subtree_choice: Dict[str, Any]  # {"retrieval": "...", "decision": "expand|rerank", "k": int, "max_expands": int, "reranker": str, ...}
 
     # Router fields (kept for compatibility)
     route: Literal["rag", "department", "reject"]

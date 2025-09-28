@@ -17,6 +17,7 @@ def _bool_env(name: str, default: bool) -> bool:
     return raw.strip() not in ("0", "false", "False", "no", "NO")
 
 # ---------------- Centralized thresholds (env-tunable) ----------------
+
 COVERAGE_TH = _float_env("RPG_COVERAGE_TH", 0.4)
 DIVERSITY_TH = _float_env("RPG_DIVERSITY_TH", 0.4)
 INTENT_COVERAGE_TH = _float_env("RPG_INTENT_COVERAGE_TH", 0.5)
@@ -27,12 +28,12 @@ NOVEL_EVIDENCE_TH = _float_env("RPG_NOVEL_EVIDENCE_TH", 0.1)
 EPSILON = _float_env("RPG_EPSILON", 0.15)
 
 # Simple A/B policy toggle (kept minimal)
-AB_POLICY = os.getenv("RPG_AB_POLICY", "A")  # "A" or "B"
+AB_POLICY = os.getenv("RPG_AB_POLICY", "A") # "A" or "B"
 
 # FeatureTree involvement toggles
-FT_DECIDES = _bool_env("RAG_FEATURETREE_DECIDES", True)  # enable tie-breaker
-TIE_MARGIN = _float_env("RAG_TIE_MARGIN", 0.05)  # ambiguity band
-DECIDE_EPS_SCALE = _float_env("RAG_DECIDE_EPS_SCALE", 0.5)  # shrink epsilon when FT used
+FT_DECIDES = _bool_env("RAG_FEATURETREE_DECIDES", True) # enable tie-breaker
+TIE_MARGIN = _float_env("RAG_TIE_MARGIN", 0.05) # ambiguity band
+DECIDE_EPS_SCALE = _float_env("RAG_DECIDE_EPS_SCALE", 0.5) # shrink epsilon when FT used
 
 def need_expand(metrics: Dict[str, Any]) -> bool:
     """
@@ -83,7 +84,8 @@ def decide_after_xp(state: Dict[str, Any]) -> str:
     """
     metrics: Dict[str, Any] = dict(state.get("retrieval_metrics") or {})
     subtree_choice = (state.get("subtree_choice") or {})
-    ft_pick = str(subtree_choice.get("retrieval") or "").lower()
+    ft_pick_retr = str(subtree_choice.get("retrieval") or "").lower()
+    ft_pick_decision = str(subtree_choice.get("decision") or "").lower()
 
     base_expand = need_expand(metrics)
     decision = "expand" if base_expand else "rerank"
@@ -96,16 +98,23 @@ def decide_after_xp(state: Dict[str, Any]) -> str:
     # Ambiguity + FeatureTree tie-break
     ft_used = False
     if _is_ambiguous(metrics) and FT_DECIDES:
-        if ft_pick == "expand":
-            decision = "expand"
+        # Prefer explicit FT decision if present
+        if ft_pick_decision in ("expand", "rerank"):
+            decision = ft_pick_decision
             ft_used = True
-        elif ft_pick in ("hybrid", "semantic"):
-            decision = "rerank"
-            ft_used = True
+        else:
+            # Backward-compatible: infer from retrieval choice
+            if ft_pick_retr == "expand":
+                decision = "expand"
+                ft_used = True
+            elif ft_pick_retr in ("hybrid", "semantic"):
+                decision = "rerank"
+                ft_used = True
 
     # Exploration probability (reduced when FT tie-break used)
     eps = EPSILON * (DECIDE_EPS_SCALE if ft_used else 1.0)
-    if random.random() < max(0.0, min(1.0, eps)):
+    import random as _rnd
+    if _rnd.random() < max(0.0, min(1.0, eps)):
         decision = "expand"
 
     return decision

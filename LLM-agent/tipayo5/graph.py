@@ -1,6 +1,7 @@
 # graph.py
 
 from langgraph.graph import StateGraph, START, END  # type: ignore
+
 from state import State  # type: ignore
 from nodes import (  # type: ignore
     compose_rpg,
@@ -14,7 +15,6 @@ from nodes import (  # type: ignore
 )
 from policy import decide_after_xp  # type: ignore
 from checkpoint_file import FileJSONSaver  # type: ignore
-
 
 def build_app():
     """

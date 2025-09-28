@@ -11,9 +11,16 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from state import State
 from db import get_vectorstore, get_llm
-from rpg import configure_rag_for_context, bind_registry_to_hints
+from rpg import (
+    configure_rag_for_context,
+    bind_registry_to_hints,
+    get_prompt,
+    call_tool,
+    suggest_tools_for_context,
+)
 
 # ---------------- Env / constants ----------------
+
 _FT_ALPHA = float(os.getenv("RPG_FT_ALPHA", "0.3"))
 _MAX_EXPANDS = int(os.getenv("RPG_MAX_EXPANDS", "3"))
 _USE_UNIT_TEST = os.getenv("RPG_USE_UNIT_TESTS", "0") not in ("0", "false", "False")
@@ -21,6 +28,7 @@ _AB_POLICY = os.getenv("RPG_AB_POLICY", "A")
 _CE_MODEL = os.getenv("RERANK_CE_MODEL", "").strip()
 
 # ---------------- Helpers ----------------
+
 def _moving_avg(old: Optional[float], new: float, alpha: float = _FT_ALPHA) -> float:
     if old is None:
         return new
@@ -91,16 +99,30 @@ def _metrics_from_pairs(pairs: List[Tuple[Document, float]], k: int) -> Dict[str
         "novel_evidence_contrib": 0.0,
     }
 
+def _token_overlap(a: str, b: str) -> float:
+    at = set((a or "").lower().split())
+    bt = set((b or "").lower().split())
+    if not at or not bt:
+        return 0.0
+    inter = len(at & bt)
+    norm = (len(at) ** 0.5) * (len(bt) ** 0.5)
+    return inter / max(1.0, norm)
+
 def _apply_rerank(pairs: List[Tuple[Document, float]], query: str, strategy: Optional[str]) -> List[Tuple[Document, float]]:
     """
     경량 리랭커:
     - strategy가 비어있으면 원 순서 유지
-    - 비용 절감을 위해 외부 모델 호출 없이 현재는 순서 유지
+    - cross_encoder/llm_based일 때 토큰 중첩 점수로 재정렬
     """
-    if not strategy or strategy == "none":
+    strat = (strategy or "none").lower()
+    if strat == "none":
         return pairs
-    # 확장 지점: CE/LLM rerank로 교체 가능
-    return pairs
+    scored: List[Tuple[Document, float]] = []
+    for d, _ in pairs:
+        score = _token_overlap(query, d.page_content or "")
+        scored.append((d, score))
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return scored
 
 def _guess_context(q: str) -> str:
     ql = (q or "").lower()
@@ -112,16 +134,28 @@ def _guess_context(q: str) -> str:
         return "conversational"
     return "general"
 
+def _choose_template_key(query: str, context_type: str) -> str:
+    ql = (query or "").lower()
+    if any(k in ql for k in ["요약", "summar"]):
+        return "summarize"
+    return "qa_grounded"
+
 # ---------------- Nodes ----------------
+
 def compose_rpg(state: State) -> Dict[str, Any]:
     t0 = time.time()
     q = state.get("query") or ""
     context_type = state.get("context_type") or _guess_context(q)
+
     reg, tpl, onto = configure_rag_for_context(context_type)
 
     base_hints: Dict[str, Any] = {"k": 8, "must_terms": []}
     hints = bind_registry_to_hints(reg.to_dict(), context_type, base_hints)
     hints = onto.enrich(q, hints)
+
+    # 컨텍스트별 기본 툴 제안 추가
+    hints["tools"] = suggest_tools_for_context(context_type)
+
     subtree_choice = {"retrieval": hints.get("strategy", "hybrid")}
 
     # minimal RPG graph/meta
@@ -221,6 +255,7 @@ def expand_search(state: State) -> Dict[str, Any]:
 
     expands = int(hints.get("expands") or 0) + 1
     hints["expands"] = expands
+
     base_k = int(hints.get("k") or 8)
     new_k = min(base_k + 4 * expands, 32)
     hints["k"] = new_k
@@ -254,9 +289,8 @@ def rerank(state: State) -> Dict[str, Any]:
     hints = dict(state.get("retrieval_hints") or {})
     strategy = hints.get("reranker") or "none"
 
-    # fabricate pairs with pseudo-scores for stable ordering
     docs = list(state.get("retrieved_docs") or [])
-    pairs = [(d, float(len(d.page_content or ""))) for d in docs]  # content length as weak proxy
+    pairs = [(d, float(len(d.page_content or ""))) for d in docs]  # initial weak score
     pairs = _apply_rerank(pairs, q, strategy=strategy)
 
     # keep top-N
@@ -286,6 +320,7 @@ def rerank(state: State) -> Dict[str, Any]:
 def plan_answer(state: State) -> Dict[str, Any]:
     t0 = time.time()
     docs: List[Document] = list(state.get("retrieved_docs") or [])
+
     # 간단 계획: 상위 문서에서 스니펫 추출
     top_n = min(5, len(docs))
     plan: List[Dict[str, Any]] = []
@@ -325,18 +360,23 @@ def generate_answer(state: State) -> Dict[str, Any]:
     plan: List[Dict[str, Any]] = state.get("answer_plan") or []
     sources: List[str] = state.get("sources") or []
     policy = state.get("citation_policy") or {"enable": True, "append_section": True, "label": "출처"}
+    hints = dict(state.get("retrieval_hints") or {})
+    ctx = state.get("context_type") or "general"
 
-    # 프롬프트 최소 구성
+    # 프롬프트 레지스트리 기반 메시지
     evidence_lines = []
     for i, p in enumerate(plan, start=1):
         snippet = p.get("snippet", "")
         src = p.get("source", f"doc_{i}")
         evidence_lines.append(f"[{i}] ({src})\n{snippet}")
+    template_key = _choose_template_key(q, ctx)
+    prompt_vars = {"query": q, "context": "\n\n".join(evidence_lines)}
+    pr = get_prompt(template_key, prompt_vars)
 
-    sys = SystemMessage(content="답변은 한국어로 간결하고 정확하게 작성하라. 모를 경우 추측하지 말라.")
-    hm = HumanMessage(content=f"질문:\n{q}\n\n증거:\n" + "\n\n".join(evidence_lines))
+    sys = SystemMessage(content=pr["system"])
+    hm = HumanMessage(content=pr["user"])
+
     llm = get_llm(temperature=0.2)
-
     try:
         answer_core = llm.invoke([sys, hm]).content.strip()
     except Exception:
@@ -352,7 +392,22 @@ def generate_answer(state: State) -> Dict[str, Any]:
         if uniq_sources:
             answer_core = f"{answer_core}\n\n{label}:\n" + "\n".join(f"- {s}" for s in uniq_sources)
 
-    log = (state.get("log") or []) + [{"phase": "answer", "dt": time.time() - t0, "note": "generated"}]
+    # 선택적 툴 호출 (예: citation_check)
+    tool_calls: List[Dict[str, Any]] = []
+    for tool_name in (hints.get("tools") or []):
+        try:
+            result = call_tool(tool_name, {"answer": answer_core, "docs": [{"text": p.get("snippet", "")} for p in plan]}, {"context_type": ctx})
+            tool_calls.append({"name": tool_name, "result": result})
+        except Exception as e:
+            tool_calls.append({"name": tool_name, "error": str(e)})
+
+    # 간단한 검증 결과 주석 추가
+    for c in tool_calls:
+        if c.get("name") == "citation_check" and isinstance(c.get("result"), dict):
+            if not c["result"].get("ok"):
+                answer_core = f"{answer_core}\n\n[검증 메모] 인용 표시가 부족할 수 있습니다."
+
+    log = (state.get("log") or []) + [{"phase": "answer", "dt": time.time() - t0, "note": "generated", "tools": tool_calls}]
     log = _trim_log(log)
 
     return {

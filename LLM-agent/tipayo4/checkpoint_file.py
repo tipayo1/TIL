@@ -11,7 +11,6 @@ from typing import Any, Optional, Iterator, Dict, List
 from langgraph.checkpoint.base import BaseCheckpointSaver, Checkpoint, CheckpointTuple  # type: ignore
 from langchain_core.runnables import RunnableConfig  # type: ignore
 
-
 def _to_plain_checkpoint(c: Checkpoint) -> Dict[str, Any]:
     """defaultdict 등을 직렬화 가능한 dict로 정규화"""
     return {
@@ -21,7 +20,6 @@ def _to_plain_checkpoint(c: Checkpoint) -> Dict[str, Any]:
         "channel_versions": dict(c["channel_versions"]),
         "versions_seen": {k: dict(v) for k, v in c["versions_seen"].items()},
     }
-
 
 class FileJSONSaver(BaseCheckpointSaver):
     """
@@ -83,7 +81,6 @@ class FileJSONSaver(BaseCheckpointSaver):
     def list(self, config: RunnableConfig) -> Iterator[CheckpointTuple]:
         conf = (config or {}).get("configurable", {})
         thread_id: str = conf.get("thread_id", "")
-
         with self._lock:
             data = self._read_all()
             for e in data.get(thread_id, []):
@@ -97,8 +94,8 @@ class FileJSONSaver(BaseCheckpointSaver):
     def put(self, config: RunnableConfig, checkpoint: Checkpoint) -> RunnableConfig:
         conf = (config or {}).get("configurable", {})
         thread_id: str = conf.get("thread_id", "")
-
         normalized = _to_plain_checkpoint(checkpoint)
+
         with self._lock:
             data = self._read_all()
             lst = data.setdefault(thread_id, [])

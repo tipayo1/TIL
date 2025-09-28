@@ -13,14 +13,9 @@ from nodes import (  # type: ignore
     generate_answer,
 )
 from policy import decide_after_xp  # type: ignore
-from checkpoint_file import FileJSONSaver  # type: ignore
 
-
+# Studio(dev)용: 내부 영속성을 사용하므로 checkpointer를 넘기지 않습니다.
 def build_app():
-    """
-    경량 단일 목적 RAG 그래프:
-    compose → refine → retrieve → award_xp → (expand | rerank) → plan → generate
-    """
     builder = StateGraph(State)
 
     # Nodes
@@ -39,7 +34,7 @@ def build_app():
     builder.add_edge("intent_parser", "retrieve_rpg")
     builder.add_edge("retrieve_rpg", "award_xp")
 
-    # 정책 분기: decide_after_xp는 "expand" 또는 "rerank"를 반환
+    # 정책 분기: expand 또는 rerank (policy.decide_after_xp가 키를 반환)
     builder.add_conditional_edges(
         "award_xp",
         decide_after_xp,
@@ -52,11 +47,17 @@ def build_app():
     # expand 후에는 rerank
     builder.add_edge("expand_search", "rerank")
 
-    # rerank 완료 후 plan → generate → END
-    builder.add_edge("rerank", "plan_answer")
+    # rerank 결과가 비면 expand로 루프백, 그 외 plan으로 진행
+    builder.add_conditional_edges(
+        "rerank",
+        lambda s: "expand" if (s.get("phase") == "expand") else "ok",
+        {
+            "expand": "expand_search",
+            "ok": "plan_answer",
+        },
+    )
+
     builder.add_edge("plan_answer", "generate_answer")
     builder.add_edge("generate_answer", END)
 
-    # LangGraph는 compile() 된 앱을 실행 대상으로 사용 (파일 기반 체크포인터 포함)
-    app = builder.compile(checkpointer=FileJSONSaver())
-    return app
+    return builder.compile()
