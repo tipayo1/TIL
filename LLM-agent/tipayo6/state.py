@@ -9,10 +9,10 @@ import operator
 from langgraph.graph import MessagesState
 from langchain_core.documents import Document
 
+
 class State(MessagesState, total=False):
     """
     RPG-Lite 내재화형 RAG 상태.
-
     - 질의/정제 질의, 검색 힌트, 템플릿/온톨로지 힌트
     - 검색 결과/메트릭, 단계 계획/최종 답변/출처
     - 라우팅/학습 신호(xp), 로그, 실행 경로
@@ -46,6 +46,7 @@ class State(MessagesState, total=False):
     xp_total: float
     fail_count: int
     log: Annotated[List[Dict[str, Any]], operator.add]  # 누적
+
     # RPG 메타 (경량): 버전/레지스트리 스냅샷/흐름 로그
     rpg: Dict[str, Any]  # {"version": str, "registry": {...}, "flows": [...]}
 
@@ -57,3 +58,10 @@ class State(MessagesState, total=False):
 
     # 선택적 FeatureTree 경량 프로필 (도메인·전략·임계값)
     feature_tree_lite: Dict[str, Any]
+
+    # 루프 제어/분기 신호(선택 필드)
+    expand_count: int
+    flat_rounds: int
+    k_zero_rounds: int
+    last_coverage: float
+    stagnant_rounds: int

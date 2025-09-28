@@ -1,349 +1,399 @@
-# nodes.py
-# - LEGO 블록 노드: compose → intent → retrieve → award_xp → expand|rerank → plan → generate
-# - 각 노드는 단일 책임, 분기는 policy에서만 수행
-# - execution_path 누적으로 Studio 단계 가시성 확보
-# - 노드 시그니처: (state, config[RunnableConfig]) 선택 도입
+# nodes.py (RPG versioning + subgraph filter + concurrency-safe search)
 
 import os
-from typing import List, Dict, Optional, Any, Tuple
+import time
+from dotenv import load_dotenv
+
+load_dotenv()
+
+from typing import List, Dict, Optional, Any, Tuple, Callable
+from concurrent.futures import ThreadPoolExecutor
 
 from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_core.runnables import RunnableConfig
 
 from state import State
-from db import get_vectorstore, get_llm, simple_overlap_score
+from db import get_vectorstore, get_llm, extract_section_terms
 from rpg import (
+    configure_rag_for_context,
     RAGComponentRegistry,
-    TemplateRegistry,
-    OntologyProvider,
+    DataFlowManager,
+    unit_test_flow_assertions,
     bind_registry_to_hints,
-    get_prompt,
+    LegalRetrievalPlugin,
 )
-from policy import need_expand, decide_after_xp
 
-# ---------------- Env / constants ----------------
-_MAX_EXPANDS = int(os.getenv("RPG_MAX_EXPANDS", "3"))
+# Shared DataFlowManager & thread pool (IO-bound tasks)
+_DFM = DataFlowManager()
+_EXEC = ThreadPoolExecutor(max_workers=int(os.getenv("RAG_MAX_WORKERS", "4")))
 
-# Optional Sentry hook
-_SENTRY_DSN = os.getenv("SENTRY_DSN", "").strip()
-if _SENTRY_DSN:
-    try:
-        import sentry_sdk  # type: ignore
-        sentry_sdk.init(dsn=_SENTRY_DSN)
-    except Exception:
-        pass
+# ---------------- Utilities ----------------
+def _append_flow_violations(state: State, frm: str, to: str, snapshot: Dict[str, Any]) -> List[Dict[str, Any]]:
+    res = _DFM.validate(frm, to, snapshot)
+    violations = (state.get("flow_violations") or [])[:]
+    if not res.get("ok"):
+        for v in res.get("violations", []):
+            violations.append({"from": frm, "to": to, "error": v})
+    return violations
 
-# ---------------- 공통 데코레이터 ----------------
-def trace_node(node_name: str):
-    """
-    - phase 설정, execution_path 누적, 노드 예외 로깅
-    - LangGraph 권장 config 인자 패턴 지원(state, config)
-    - 운영시 Sentry 훅을 통해 예외 보고 가능(옵션)
-    - Command 반환 패턴도 가능하나, 본 구현은 조건부 엣지로 라우팅(그래프에서 관리)
-    """
-    def wrapper(fn):
-        def inner(state: State, config: Optional[RunnableConfig] = None) -> State:
-            state["phase"] = node_name
-            ep = list(state.get("execution_path", []))
-            ep.append(node_name)
-            state["execution_path"] = ep
-            try:
-                if config is None:
-                    return fn(state)
-                # 함수가 config를 받지 않는 경우 안전 폴백
-                try:
-                    return fn(state, config)
-                except TypeError:
-                    return fn(state)
-            except Exception as e:
-                log = list(state.get("log", []))
-                log.append({"node": node_name, "error": str(e)})
-                state["log"] = log
-                state["fail_count"] = int(state.get("fail_count", 0)) + 1
-                if _SENTRY_DSN:
-                    try:
-                        import sentry_sdk  # type: ignore
-                        sentry_sdk.capture_exception(e)
-                    except Exception:
-                        pass
-                raise
-        return inner
-    return wrapper
+def _get_question(state: State) -> str:
+    # prefer latest human/user message; fallback to explicit field
+    msgs = state.get("messages") or []
+    for m in reversed(list(msgs)):
+        content = None
+        role = None
+        if hasattr(m, "content"):
+            content = getattr(m, "content", None)
+            role = getattr(m, "type", None) or getattr(m, "role", None)
+        if isinstance(m, dict):
+            content = m.get("content")
+            role = m.get("type") or m.get("role")
+        if role in ("human", "user") and isinstance(content, str) and content.strip():
+            return content.strip()
+    return (state.get("query") or "").strip()
 
-# ---------------- Helpers ----------------
-def _doc_id(doc: Document) -> str:
-    mid = (doc.metadata or {}).get("id")
-    if mid:
-        return str(mid)
-    return str(abs(hash((doc.page_content or "")[:200])))
+def _infer_context_type(q: str) -> str:
+    ql = q.lower()
+    if any(k in ql for k in ["법", "판례", "조항", "legal", "contract", "compliance"]):
+        return "legal"
+    if any(k in ql for k in ["code", "function", "error", "stack", "api", "기술", "기능", "스택", "버그"]):
+        return "technical"
+    if any(k in ql for k in ["대화", "챗봇", "상담", "chat", "conversation"]):
+        return "conversational"
+    return "general"
 
-def _compute_metrics(query: str, docs: List[Document], must_terms: List[str], filters: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    경량 메트릭 집계(coverage/diversity/intent_coverage/negative_rate/ontology_coverage)
-    """
-    if not docs:
-        return {
-            "k": 0, "n": 0, "avg_score": 0.0, "coverage": 0.0, "diversity": 0.0,
-            "intent_coverage": 0.0, "negative_rate": 1.0, "novel_evidence_contrib": 0.0,
-            "ontology_coverage": 0.0
+def _source_diversity(docs_: List[Document]) -> float:
+    if not docs_:
+        return 0.0
+    sources = set()
+    for d in docs_:
+        meta = getattr(d, "metadata", {}) or {}
+        src = meta.get("source") or meta.get("file") or meta.get("url") or "unknown"
+        sources.add(src)
+    return round(len(sources) / max(1, len(docs_)), 3)
+
+def _calc_metrics(docs: List[Document], k: int) -> Dict[str, Any]:
+    n = len(docs)
+    scores = [
+        float((d.metadata or {}).get("score") or 0.0)
+        for d in docs
+        if isinstance((d.metadata or {}).get("score"), (int, float))
+    ]
+    avg_score = round(sum(scores) / len(scores), 4) if scores else 0.0
+    coverage = round(min(1.0, n / max(1, k)), 3)
+    diversity = _source_diversity(docs)
+    return {"k": k, "n": n, "avg_score": avg_score, "coverage": coverage, "diversity": diversity}
+
+def _run_vs_search(vs, q: str, k: int, meta_filter: Optional[Dict[str, Any]] = None) -> List[Tuple[Document, float]]:
+    # execute similarity search in thread pool to avoid blocking event loops
+    fut = _EXEC.submit(vs.similarity_search_with_score, q, k, None, meta_filter)
+    return fut.result()
+
+def _merge_scored_docs(pairs: List[Tuple[Document, float]], seen: set) -> List[Document]:
+    out: List[Document] = []
+    for d, s in pairs:
+        key = (d.page_content.strip()[:120], (d.metadata or {}).get("source", ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        md = dict(d.metadata or {})
+        md["score"] = float(s)
+        d.metadata = md
+        out.append(d)
+    return out
+
+# ---------- RPG persistence helpers ----------
+def _now() -> float:
+    return time.time()
+
+def _merge_rpg_graph(prev: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, Any]:
+    # Minimal, conservative merge: prefer new meta, keep both roots; deduplicate by name
+    prev_roots = {r.get("name"): r for r in (prev.get("roots") or []) if isinstance(r, dict)}
+    new_roots = {r.get("name"): r for r in (new.get("roots") or []) if isinstance(r, dict)}
+    merged_names = list({*prev_roots.keys(), *new_roots.keys()})
+    roots = []
+    for name in merged_names:
+        # new overrides on name collision
+        roots.append(new_roots.get(name) or prev_roots.get(name))
+    meta = dict(prev.get("meta") or {})
+    meta.update(new.get("meta") or {})
+    return {"meta": meta, "roots": roots}
+
+def _update_rpg_versions(state: State, new_graph_dict: Dict[str, Any], note: str) -> Dict[str, Any]:
+    versions = list(state.get("rpg_versions") or [])
+    curr_version = int(state.get("rpg_version") or 0)
+    prev_graph = (state.get("rpg") or {}).get("graph")
+
+    if prev_graph:
+        merged = _merge_rpg_graph(prev_graph, new_graph_dict)
+    else:
+        merged = new_graph_dict
+
+    # append snapshot of previous as versioned history (keep tail N)
+    N = int(os.getenv("RPG_VERSION_HISTORY", "10"))
+    if prev_graph:
+        versions.append({"version": curr_version, "graph": prev_graph, "ts": _now(), "note": "prev"})
+        if len(versions) > N:
+            versions = versions[-N:]
+
+    return {
+        "rpg": {"graph": merged, "registry": (state.get("rpg") or {}).get("registry") or {}, "flows": (state.get("rpg") or {}).get("flows") or []},
+        "rpg_versions": versions,
+        "rpg_version": curr_version + 1,
+        "log": (state.get("log") or []) + [{"phase": "setup", "rpg_version": curr_version + 1, "note": note}],
+    }
+
+# ---------- Subgraph filter ----------
+def _doc_context_ok(doc: Document, ctx: str, q_terms: List[str]) -> bool:
+    md = doc.metadata or {}
+    ext = (md.get("ext") or "").lower()
+    ns_terms = md.get("ns_terms") or []
+
+    if ctx == "legal":
+        # If section terms are present in query, require overlap; else allow legal-friendly formats
+        if q_terms:
+            return any(t in ns_terms for t in q_terms)
+        return ext in [".pdf", ".docx", ".md", ".txt"]
+    if ctx == "technical":
+        return ext in [".py", ".ipynb", ".md", ".rst", ".json", ".yaml", ".yml", ".toml"]
+    if ctx == "conversational":
+        return ext in [".md", ".txt", ".html", ".htm"]
+    return True
+
+def _apply_rpg_subgraph_filter(docs: List[Document], state: State) -> List[Document]:
+    ctx = state.get("context_type") or "general"
+    q = state.get("refined_query") or state.get("query") or ""
+    q_terms = extract_section_terms(q) or []
+    kept: List[Document] = []
+    for d in docs:
+        if _doc_context_ok(d, ctx, q_terms):
+            kept.append(d)
+    return kept
+
+# ---------------- Compose RPG ----------------
+def compose_rpg(state: State) -> Dict[str, Any]:
+    q = (_get_question(state) or state.get("refined_query") or state.get("query") or "").strip()
+    context_type = _infer_context_type(q)
+
+    # Build fresh RPG by context
+    rpg_graph = configure_rag_for_context(context_type, q)
+    registry = RAGComponentRegistry().to_dict()
+
+    # base hints + registry binding
+    hints = state.get("retrieval_hints") or {"k": 8, "strategy": "semantic"}
+    hints = bind_registry_to_hints(registry, context_type, hints)
+
+    # optional plugins
+    plugins = state.get("plugins") or []
+    if context_type == "legal":
+        p = LegalRetrievalPlugin()
+        upd = p.execute({"retrieval_hints": hints, "plugins": plugins})
+        hints = upd.get("retrieval_hints", hints)
+        plugins = upd.get("plugins", plugins)
+
+    flows = _DFM.describe()
+    path = rpg_graph.suggest_execution_path(state.get("retrieval_metrics") or {})
+    schema_issues = unit_test_flow_assertions(_DFM)
+
+    # RPG versioning: merge with previous + record history
+    base_update = {
+        "execution_path": path,
+        "retrieval_hints": hints,
+        "context_type": context_type,
+        "plugins": plugins,
+        "phase": "setup",
+        "flow_violations": state.get("flow_violations") or [],
+    }
+    # Ensure registry/flows are available for new 'rpg'
+    state_prime = {**state, **{"rpg": {"graph": (state.get("rpg") or {}).get("graph"), "registry": registry, "flows": flows}}}
+    vupd = _update_rpg_versions(state_prime, rpg_graph.to_dict(), note="compose")
+
+    log = (vupd.get("log") or []) + [{"phase": "setup", "rpg": True, "path": path, "schema_issues": schema_issues}]
+    return {
+        **base_update,
+        **vupd,
+        "log": log,
+    }
+
+# ---------------- Intent parsing ----------------
+def intent_parser(state: State) -> Dict[str, Any]:
+    base = _get_question(state)
+    prev_q = (state.get("query") or "").strip()
+    reset_block: Dict[str, Any] = {}
+    if base and base != prev_q:
+        reset_block = {
+            "retrieved_docs": [],
+            "retrieval_metrics": {},
+            "answer_plan": [],
+            "answer": "",
         }
 
-    scores = [simple_overlap_score(query, d) for d in docs]
-    avg = sum(scores) / len(scores) if scores else 0.0
-    sources = [str((d.metadata or {}).get("source", "unknown")) for d in docs]
-    uniq = len(set(sources)) / float(max(1, len(sources)))
-    neg = sum(1 for d in docs if not (d.page_content or "").strip()) / float(len(docs))
-
-    def _match(d: Document) -> float:
-        text = (d.page_content or "").lower()
-        must_ok = all((t or "").lower() in text for t in (must_terms or [])) if must_terms else True
-        filt_ok = True
-        md = d.metadata or {}
-        for k, v in (filters or {}).items():
-            if isinstance(v, (list, tuple, set)):
-                if md.get(k) not in v:
-                    filt_ok = False
-                    break
-            else:
-                if md.get(k) != v:
-                    filt_ok = False
-                    break
-        return 1.0 if (must_ok and filt_ok) else 0.0
-
-    onto_cov = sum(_match(d) for d in docs) / float(len(docs))
-    return {
-        "k": len(docs),
-        "n": len(docs),
-        "avg_score": avg,
-        "coverage": avg,
-        "diversity": uniq,
-        "intent_coverage": max(0.0, min(1.0, avg + 0.05)),
-        "negative_rate": neg,
-        "novel_evidence_contrib": 0.0,
-        "ontology_coverage": onto_cov,
+    hints = state.get("retrieval_hints") or {"k": 8, "strategy": "semantic"}
+    update: Dict[str, Any] = {
+        "query": base,
+        "refined_query": base,
+        "retrieval_hints": hints,
+        "phase": "refine",
+        **reset_block,
     }
 
-# ---------------- Nodes ----------------
+    violations = _append_flow_violations(state, "intent_parser", "retrieve_rpg", {**state, **update})
+    log = (state.get("log") or []) + [{"phase": "refine", "refined_query": base, "hints": hints, "violations": len(violations)}]
+    update["log"] = log
+    update["flow_violations"] = violations
+    return update
 
-@trace_node("compose_rpg")
-def compose_rpg(state: State, config: Optional[RunnableConfig] = None) -> State:
-    """
-    - 레지스트리/템플릿/온톨로지 초기화
-    - 온톨로지 분석 → 기본 hints 생성 → 레지스트리 병합
-    - RPG 메타 스냅샷 저장
-    """
-    reg = RAGComponentRegistry()
-    templ = TemplateRegistry()
-    onto = OntologyProvider()
-    q = state.get("query", "") or ""
-    onto_hints = onto.analyze(q)
-
-    hints = {
-        "must_terms": onto_hints.get("must_terms", []),
-        "filters": onto_hints.get("filters", {}),
-        "strategy": "hybrid",
-        # rerank 기본은 overlap, 필요 시 환경으로 경량 CE 활성화
-        "rerank": "overlap" if not os.getenv("RERANK_CE_ENABLE", "").strip() else "lite_ce",
-    }
-    hints = bind_registry_to_hints(reg, hints)
-
-    state["retrieval_hints"] = hints
-    state["template_hints"] = {"style": "concise"}
-    state["ontology_version"] = onto_hints.get("ontology_version", "v0.1-lite")
-    state["ontology_entities"] = {"entities": onto_hints.get("entities", []), "domain": onto_hints.get("domain", "general")}
-    state["rpg"] = {"version": "rpg-lite-0.2", "registry": reg.snapshot(), "flows": []}
-
-    # 학습/진행/메타 초기화
-    state["xp"] = int(state.get("xp", 0))
-    state["xp_total"] = float(state.get("xp_total", 0.0))
-    state["fail_count"] = int(state.get("fail_count", 0))
-    state["log"] = list(state.get("log", []))
-    state["execution_path"] = list(state.get("execution_path", []))
-    state["seen_doc_ids"] = list(state.get("seen_doc_ids", []))
-    state["feature_tree_lite"] = state.get("feature_tree_lite", {"routing": {"prefer": "rerank"}})
-
-    # config 활용 예시(표준화): thread_id를 로그에 남김
-    tid = ((config or {}).get("configurable") or {}).get("thread_id") if config else None
-    if tid:
-        state["log"].append({"node": "compose_rpg", "thread_id": tid})
-
-    return state
-
-@trace_node("intent_parser")
-def intent_parser(state: State, config: Optional[RunnableConfig] = None) -> State:
-    """
-    - LLM으로 retrieval 친화적 질의 정제
-    - 템플릿 기반 System/Human 메시지 구성
-    """
-    templ = TemplateRegistry()
-    llm = get_llm(temperature=0.0)
-    sys = SystemMessage(content=get_prompt(templ, "system_base"))
-    hm = HumanMessage(content=f"{get_prompt(templ, 'ask_intent')}\n\nQuery:\n{state.get('query','')}")
-    out = llm.invoke([sys, hm])
-    refined = out.content.strip() if hasattr(out, "content") else state.get("query", "")
-    state["refined_query"] = refined
-    return state
-
-@trace_node("retrieve_rpg")
-def retrieve_rpg(state: State, config: Optional[RunnableConfig] = None) -> State:
-    """
-    - VectorStore에서 k개 검색 (전략/파라미터는 hints에서)
-    - 메타데이터/온톨로지 must_terms 필터를 적용
-    - 경량 메트릭 계산 및 저장
-    """
-    hints = state.get("retrieval_hints", {}) or {}
-    params = hints.get("params", {}) or {}
-    k = int(params.get("k", 8))
-    filters = hints.get("filters", {}) or {}
-    must_terms = hints.get("must_terms", []) or []
-
+# ---------------- Primary retrieval ----------------
+def retrieve_rpg(state: State) -> Dict[str, Any]:
     vs = get_vectorstore()
-    query = state.get("refined_query") or state.get("query") or ""
-    fetch_k = int(params.get("fetch_k", max(k * 3, k + 10)))  # FAISS 폴백 대비
-    pairs: List[Tuple[Document, float]] = vs.similarity_search_with_score(
-        query, k=k, filters=filters, must_terms=must_terms, fetch_k=fetch_k  # type: ignore
-    )
+    q = state.get("refined_query") or state.get("query") or ""
+    hints = state.get("retrieval_hints") or {}
+    k = int(hints.get("k") or 8)
+    strategy = hints.get("strategy", "semantic")
+    section_boost = bool(hints.get("section_boost"))
 
-    docs = [p[0] for p in pairs] if pairs else []
-    metrics = _compute_metrics(query, docs, must_terms, filters)
+    # Build an optional metadata filter from RPG if available (kept minimal here)
+    meta_filter: Optional[Dict[str, Any]] = None
 
-    state["retrieved_docs"] = docs
-    state["retrieval_metrics"] = metrics
-    return state
+    docs: List[Document] = []
+    if strategy == "hybrid":
+        # run two searches concurrently and merge
+        terms = extract_section_terms(q) or []
+        expanded_query = (q + " " + " ".join(terms)).strip() if terms else q
+        fut_a = _EXEC.submit(vs.similarity_search_with_score, q, int(k * 0.6), None, meta_filter)
+        fut_b = _EXEC.submit(vs.similarity_search_with_score, expanded_query, int(k * 0.6), None, meta_filter)
+        pairs = fut_a.result() + fut_b.result()
+        seen = set()
+        docs = _merge_scored_docs(pairs, seen)
+    else:
+        # semantic but with legal section boost if requested
+        base_pairs = _run_vs_search(vs, q, k, meta_filter)
+        seen = set()
+        docs = _merge_scored_docs(base_pairs, seen)
+        if section_boost:
+            terms = extract_section_terms(q) or []
+            if terms:
+                expanded_query = (q + " " + " ".join(terms)).strip()
+                extra_pairs = _run_vs_search(vs, expanded_query, max(4, int(k * 0.5)), meta_filter)
+                docs += _merge_scored_docs(extra_pairs, seen)
 
-@trace_node("award_xp")
-def award_xp(state: State, config: Optional[RunnableConfig] = None) -> State:
-    """
-    - 새 증거 공헌도: 이전에 보지 않은 문서 비율을 novel로 반영
-    - xp/xp_total 갱신
-    """
-    seen = set(state.get("seen_doc_ids", []))
-    docs = state.get("retrieved_docs", []) or []
-    new_ids = []
-    for d in docs:
-        did = _doc_id(d)
-        if did not in seen:
-            new_ids.append(did)
-            seen.add(did)
+    # RPG subgraph filter BEFORE prompt injection
+    docs = _apply_rpg_subgraph_filter(docs, state)
 
-    novel_rate = (len(new_ids) / float(max(1, len(docs)))) if docs else 0.0
-    metrics = dict(state.get("retrieval_metrics", {}) or {})
-    metrics["novel_evidence_contrib"] = novel_rate
-    state["retrieval_metrics"] = metrics
+    metrics = _calc_metrics(docs, k)
+    update = {"retrieved_docs": docs, "retrieval_metrics": metrics, "phase": "search"}
+    violations = _append_flow_violations(state, "retrieve_rpg", "award_xp", {**state, **update})
+    log = (state.get("log") or []) + [{"phase": "search", "k": k, "strategy": strategy, "metrics": metrics, "violations": len(violations)}]
+    update["log"] = log
+    update["flow_violations"] = violations
+    return update
 
-    inc = 1.0 if novel_rate >= 0.3 else 0.5 if novel_rate > 0 else 0.2
-    state["xp"] = int(state.get("xp", 0)) + 1
-    state["xp_total"] = float(state.get("xp_total", 0.0)) + inc
-    state["seen_doc_ids"] = list(seen)
-    return state
+# ---------------- Expanded retrieval ----------------
+def expand_search(state: State) -> Dict[str, Any]:
+    vs = get_vectorstore()
+    q = state.get("refined_query") or state.get("query") or ""
+    terms = extract_section_terms(q) or []
+    expanded = (q + " " + " ".join(terms)).strip() if terms else q
 
-@trace_node("expand_search")
-def expand_search(state: State, config: Optional[RunnableConfig] = None) -> State:
-    """
-    - 힌트만 갱신(폭 확장): k 증가, diversity 옵션 부여 등
-    - 실제 재검색은 그래프 엣지 루프로 retrieve_rpg에서 수행
-    """
-    hints = dict(state.get("retrieval_hints", {}) or {})
-    params = dict(hints.get("params", {}) or {})
-    params["k"] = int(params.get("k", 8)) + 4  # 점진 확장
-    params["diversity_boost"] = True
-    params["fetch_k"] = max(int(params.get("fetch_k", 0)), params["k"] * 3)
-    hints["params"] = params
-    state["retrieval_hints"] = hints
+    base_docs = state.get("retrieved_docs") or []
+    k = int((state.get("retrieval_hints") or {}).get("k", 16))
 
-    # 확장 횟수 추적(로그)
-    meta = dict(state.get("rpg", {}) or {})
-    flows = list(meta.get("flows", []))
-    flows.append({"at": "expand_search", "k": params["k"]})
-    meta["flows"] = flows
-    state["rpg"] = meta
-    return state
+    meta_filter: Optional[Dict[str, Any]] = None
+    pairs = _run_vs_search(vs, expanded, k, meta_filter)
 
-@trace_node("rerank")
-def rerank(state: State, config: Optional[RunnableConfig] = None) -> State:
-    """
-    - 선택적 경량 CE 리랭크, 기본은 overlap 폴백
-    - 문서 순서를 정제하고 상위 k만 유지
-    """
-    hints = state.get("retrieval_hints", {}) or {}
-    docs = list(state.get("retrieved_docs", []) or [])
-    query = state.get("refined_query") or state.get("query") or ""
-    params = hints.get("params", {}) or {}
-    k = int(params.get("k", 8))
-    if not docs:
-        return state
+    seen = set((d.page_content.strip()[:120], (d.metadata or {}).get("source", "")) for d in base_docs)
+    new_docs = _merge_scored_docs(pairs, seen)
 
-    rerank_params = hints.get("rerank_params", {}) or {}
-    rtype = rerank_params.get("type", "overlap")
-    ranked: List[Tuple[Document, float]]
+    merged = list(base_docs) + new_docs
+    # Apply subgraph filter again to expanded set to avoid drift
+    merged = _apply_rpg_subgraph_filter(merged, state)
 
-    if rtype == "cross_encoder":
-        model_name = rerank_params.get("model") or os.getenv("RERANK_CE_MODEL", "").strip()
-        if model_name:
-            try:
-                from sentence_transformers import CrossEncoder  # type: ignore
-                bs = int(rerank_params.get("batch_size", int(os.getenv("RERANK_CE_BATCH_SIZE", "16"))))
-                topn = int(rerank_params.get("topn", int(os.getenv("RERANK_TOPN", str(k)))))
-                cand = docs[:max(k, min(len(docs), topn))]
-                pairs = [[query, d.page_content or ""] for d in cand]
-                ce = CrossEncoder(model_name)
-                scores = ce.predict(pairs, batch_size=bs)
-                ranked = sorted(list(zip(cand, [float(s) for s in scores])), key=lambda x: x[1], reverse=True)
-                state["retrieved_docs"] = [d for d, _ in ranked[:k]]
-                return state
-            except Exception:
-                # 폴백: overlap
-                pass
+    metrics = _calc_metrics(merged, k)
+    update = {"retrieved_docs": merged, "retrieval_metrics": metrics, "phase": "expand"}
+    violations = _append_flow_violations(state, "expand_search", "rerank", {**state, **update})
+    log = (state.get("log") or []) + [{"phase": "expand", "query": expanded, "metrics": metrics, "violations": len(violations)}]
+    update["log"] = log
+    update["flow_violations"] = violations
+    return update
 
-    # 기본/폴백: overlap
-    ranked = sorted([(d, simple_overlap_score(query, d)) for d in docs], key=lambda x: x[1], reverse=True)
-    state["retrieved_docs"] = [d for d, _ in ranked[:k]]
-    return state
+# ---------------- XP update and path refresh ----------------
+def award_xp(state: State) -> Dict[str, Any]:
+    met = state.get("retrieval_metrics") or {}
+    xp = int(state.get("xp") or 0)
+    fails = int(state.get("fail_count") or 0)
+    n = int(met.get("n") or 0)
+    coverage = float(met.get("coverage") or 0.0)
+    diversity = float(met.get("diversity") or 0.0)
+    delta = 1 + int(coverage * 3) + int(diversity * 2) + (2 if n >= 8 else 0)
+    xp += max(1, delta)
+    if n == 0:
+        fails += 1
 
-@trace_node("plan_answer")
-def plan_answer(state: State, config: Optional[RunnableConfig] = None) -> State:
-    """
-    - LLM으로 다중 클레임 계획 간단 생성
-    - 증거 인덱스는 상위 3개 문서를 매핑(간이)
-    """
-    templ = TemplateRegistry()
-    llm = get_llm(temperature=0.0)
-    sys = SystemMessage(content=get_prompt(templ, "system_base"))
-    joined = "\n\n".join([f"[{i}] {d.page_content[:400]}" for i, d in enumerate(state.get("retrieved_docs", [])[:3])])
-    hm = HumanMessage(content=f"{get_prompt(templ, 'plan_answer')}\n\nQuery:\n{state.get('refined_query') or state.get('query','')}\n\nEvidence:\n{joined}")
-    out = llm.invoke([sys, hm])
-    plan_text = out.content.strip() if hasattr(out, "content") else ""
-    claims = [ln.strip("- ").strip() for ln in plan_text.splitlines() if ln.strip()]
-    plan = [{"claim": c, "evidence": [0, 1, 2]} for c in claims[:3]] or [{"claim": "Direct answer", "evidence": [0, 1]}]
-    state["answer_plan"] = plan
-    return state
+    try:
+        from rpg import RPGGraph  # local import
+        new_path = RPGGraph().suggest_execution_path(met)
+    except Exception:
+        new_path = state.get("execution_path") or []
 
-@trace_node("generate_answer")
-def generate_answer(state: State, config: Optional[RunnableConfig] = None) -> State:
-    """
-    - LLM으로 최종 생성
-    - citation_policy에 따라 출처 라벨 포함
-    """
-    templ = TemplateRegistry()
-    llm = get_llm(temperature=0.2)
-    sys = SystemMessage(content=get_prompt(templ, "system_base"))
-    ev = state.get("retrieved_docs", []) or []
-    joined = "\n\n".join([f"[{i}] {d.page_content[:600]}" for i, d in enumerate(ev[:5])])
-    hm = HumanMessage(content=f"{get_prompt(templ, 'generate_answer')}\n\nPlan:\n{state.get('answer_plan')}\n\nEvidence:\n{joined}\n\nQuery:\n{state.get('refined_query') or state.get('query','')}")
-    out = llm.invoke([sys, hm])
-    answer = out.content.strip() if hasattr(out, "content") else ""
-    state["answer"] = answer
+    # Keep current merged RPG and bump version note=award_xp (no graph change)
+    vupd = _update_rpg_versions(state, (state.get("rpg") or {}).get("graph") or {"meta": {}, "roots": []}, note="award_xp")
 
-    # 출처 수집(중복 제거)
-    srcs: List[str] = []
-    for d in ev[:5]:
-        src = str((d.metadata or {}).get("source", "")) or "doc"
-        if src not in srcs:
-            srcs.append(src)
-    state["sources"] = srcs
-    return state
+    update = {
+        "xp": xp,
+        "fail_count": fails,
+        "execution_path": new_path or state.get("execution_path") or [],
+        "phase": state.get("phase") or "search",
+        **vupd,
+    }
 
-# 참고: 특정 노드에서 “업데이트 + 라우팅”을 동시 처리해야 할 케이스는
-# Command 반환 패턴으로 대체 가능(예: return Command(goto="rerank")),
-# 본 설계는 정책 외부화 + 조건부 엣지로 라우팅을 유지(그래프에서 관리).
+    # logging only (branching is handled by graph conditional edges)
+    log = (state.get("log") or []) + [{"phase": "search", "xp_award": delta, "xp_total": xp, "path": new_path}]
+    update["log"] = log
+    update["flow_violations"] = state.get("flow_violations") or []
+    return update
+
+# ---------------- Rerank ----------------
+def rerank(state: State) -> Dict[str, Any]:
+    docs = state.get("retrieved_docs") or []
+    docs = sorted(docs, key=lambda d: float((d.metadata or {}).get("score") or 0.0), reverse=True)[:20]
+    update = {"retrieved_docs": docs, "phase": "rerank"}
+    violations = _append_flow_violations(state, "rerank", "plan_answer", {**state, **update})
+    log = (state.get("log") or []) + [{"phase": "rerank", "kept": len(docs), "violations": len(violations)}]
+    update["log"] = log
+    update["flow_violations"] = violations
+    return update
+
+# ---------------- Plan ----------------
+def plan_answer(state: State) -> Dict[str, Any]:
+    docs = state.get("retrieved_docs") or []
+    q = state.get("refined_query") or state.get("query") or ""
+    plan: List[Dict[str, Any]] = []
+    for i, d in enumerate(docs[:8]):
+        snippet = d.page_content.strip().splitlines()[0][:160]
+        plan.append({"claim": f"근거 {i+1}: {snippet}", "evidence": [i]})
+    update = {"answer_plan": plan, "phase": "plan"}
+    violations = _append_flow_violations(state, "plan_answer", "generate_answer", {**state, **update})
+    log = (state.get("log") or []) + [{"phase": "plan", "items": len(plan), "query": q, "violations": len(violations)}]
+    update["log"] = log
+    update["flow_violations"] = violations
+    return update
+
+# ---------------- Generate ----------------
+def generate_answer(state: State) -> Dict[str, Any]:
+    llm = get_llm()
+    q = state.get("refined_query") or state.get("query") or ""
+    docs = state.get("retrieved_docs") or []
+    plan = state.get("answer_plan") or []
+    evid_texts: List[str] = []
+    for item in plan[:6]:
+        for idx in item.get("evidence", []):
+            if 0 <= idx < len(docs):
+                d = docs[idx]
+                src = (d.metadata or {}).get("source") or ""
+                evid_texts.append(f"[{idx}] {src}: {d.page_content[:300]}")
+    system = SystemMessage(content="답변은 근거 기반으로 간결하게 작성하고, 필요한 경우 근거 색인 번호를 각 문단 끝에 대괄호로 표기하세요.")
+    human = HumanMessage(content=f"질문: {q}\n\n근거 후보:\n" + "\n".join(evid_texts))
+    resp = llm.invoke([system, human])
+    text = getattr(resp, "content", "") if hasattr(resp, "content") else str(resp)
+    log = (state.get("log") or []) + [{"phase": "answer", "chars": len(text)}]
+    return {"answer": text, "phase": "answer", "log": log}

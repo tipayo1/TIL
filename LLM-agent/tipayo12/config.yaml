@@ -1,0 +1,123 @@
+# config.yaml - LangGraph RAG 시스템 설정 파일
+
+# 시스템 전반 설정
+system:
+  log_level: INFO
+  max_memory_usage: 1GB
+  max_execution_time: 300
+
+# LLM 설정
+llm:
+  default_model: gpt-4o-mini
+  temperature: 0.1
+  max_tokens: 1000
+  timeout: 30
+
+# 벡터 데이터베이스 설정
+vector_db:
+  default_type: faiss  # pinecone, faiss, memory 중 선택
+  embedding_model: text-embedding-3-small
+  chunk_size: 1000
+  chunk_overlap: 200
+
+  # Pinecone 설정 (사용시)
+  pinecone:
+    environment: us-east-1
+    index_name: langgraph-rag
+    dimension: 1536
+
+  # FAISS 설정
+  faiss:
+    local_path: ./faiss_index
+    save_interval: 300  # 5분마다 저장
+
+# RPG (Repository Planning Graph) 설정
+rpg:
+  max_nodes: 50
+  max_execution_time: 600
+  enable_parallel_execution: true
+  template_path: ./templates/rpg
+
+# 메모리 시스템 설정
+memory:
+  short_term_size: 100
+  short_term_ttl: 3600  # 1시간
+  long_term_cache_size: 1000
+  cleanup_interval: 300  # 5분
+
+# 도메인별 설정
+domains:
+  hr:
+    index_name: hr-rules
+    documents_path: ./data/hr
+    specialized_agents:
+      - hr_policy_expert
+      - hr_procedure_guide
+
+  general:
+    index_name: general-docs
+    documents_path: ./data/general
+
+  academic:
+    index_name: academic-papers
+    documents_path: ./data/papers
+
+# 에이전트 설정
+agents:
+  llm_agents:
+    gen:
+      model: gpt-4o-mini
+      temperature: 0.1
+      max_tokens: 1500
+    router1:
+      model: gpt-4o-mini
+      temperature: 0.0
+      max_tokens: 500
+    router2:
+      model: gpt-4o-mini
+      temperature: 0.0
+      max_tokens: 500
+
+  autonomous:
+    max_iterations: 10
+    planning_depth: 3
+    enable_self_correction: true
+
+  coordinator:
+    max_concurrent_agents: 5
+    timeout_per_agent: 60
+
+# 라우팅 설정
+routing:
+  confidence_threshold: 0.7
+  enable_llm_routing: true
+  enable_rpg_routing: true
+  fallback_route: rag_answer
+
+# 도구 설정
+tools:
+  enable_file_tools: true
+  enable_web_tools: false  # 보안상 기본 비활성화
+  enable_database_tools: true
+  tool_timeout: 30
+
+# 모니터링 설정
+monitoring:
+  enable_metrics: true
+  enable_profiling: true
+  history_limit: 1000
+  log_file: langgraph_rag.log
+
+# 보안 설정
+security:
+  enable_input_validation: true
+  max_input_length: 10000
+  allowed_file_extensions:
+    - .txt
+    - .md
+    - .pdf
+    - .docx
+  blocked_patterns:
+    - "<script"
+    - "javascript:"
+    - "eval("
